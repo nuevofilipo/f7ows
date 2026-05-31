@@ -1,0 +1,2 @@
+this scripts folder just contain random scripts, for example the check scripts are essentially some simple
+tests to verify whether the migration has worked

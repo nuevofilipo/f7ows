@@ -1,0 +1,1001 @@
+2026-05-31 — Fixed Docling parser to parse a real STEM PDF cleanly
+=================================================================
+
+First end-to-end run on a real PDF (test.pdf, ~75-80pp) surfaced several problems.
+All fixed in app/ingest/parse.py:
+
+1. Windows symlink crash on model download (WinError 1314). HF model caching tries
+   to symlink, which needs admin/Developer Mode. Fix: set
+   os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1") at module top (before any
+   huggingface_hub import) so HF copies instead. Works now with no manual env var.
+
+2. Garbled text (the big one). Docling's DEFAULT backend (docling-parse) mangled
+   text on a PDF with custom font encoding: "Scattered" -> "Sca tt e r e d". Raw
+   pypdfium2 extraction of the same page was clean, proving it was the backend, not
+   the source PDF. Fix: pin the pypdfium2 backend
+   (PdfFormatOption(backend=PyPdfiumDocumentBackend)). Output ~32K -> ~113K chars,
+   text clean, full page coverage.
+
+3. std::bad_alloc dropped ~10 pages during the preprocess/render stage (silent
+   partial ingestion). Switching to the pypdfium2 backend made these disappear.
+   Also hardened the contract: parse() now calls convert(raises_on_error=False),
+   checks result.status, and RAISES a new ParseError on FAILURE / PARTIAL_SUCCESS
+   unless allow_partial=True. Rationale: for RAG, silently ingesting part of a doc
+   is a data-integrity bug — fail loud so the worker can mark the doc errored.
+
+4. Reverted a bad earlier change: I'd switched the layout model to DOCLING_LAYOUT_V2
+   with a comment blaming a torch "even kernels" error that was never actually
+   observed (the only real failure was the symlink one). Back to Docling's default
+   (Heron) layout. Lesson: don't encode speculation as fact in comments.
+
+5. Test-harness Unicode crash: print(markdown[:1500]) died on the cp1252 console
+   for a LaTeX arrow. Fix: sys.stdout.reconfigure(encoding="utf-8") in __main__
+   (file write was already utf-8). Harness uses allow_partial=True so you can still
+   eyeball output on partial conversions.
+
+Process notes (why this run was slow/expensive): each full parse is ~3.5 min
+(80pp, CPU, layout+table models), and I re-ran it several times to diagnose/verify.
+A workspace hook also polluted my reads of files in backend/ with repeated
+"file is being written concurrently" text, so inspecting test_output.md kept
+failing and I retried multiple ways. Final on-disk parse.py is the pypdfium2
+version (verified).
+
+Known fidelity gaps (NOT bugs — deferred per PHASE4_PLAN_v2 §6): math is emitted as
+plain text, not LaTeX (0 '$' delimiters) — Docling's do_formula_enrichment (a
+separate CodeFormula model) is off by default; figures become '<!-- image -->'
+placeholders — VLM/figure captioning is explicit future scope. Open question for the
+user: enable formula enrichment now for LaTeX, or defer.
+
+
+2026-05-30 — Implemented the Docling PDF parser (Phase 4, step 2)
+================================================================
+
+What:
+- Installed `docling` (2.96.0) into backend/venv; added `docling>=2.96` to
+  requirements.txt. (Pulls torch/transformers/etc. — large but local & free.)
+- New package `app/ingest/` (with __init__.py) to group the pipeline modules
+  (parse -> chunk -> embed).
+- `app/ingest/parse.py`: isolated Docling wrapper exposing `parse(pdf_bytes,
+  name=...) -> str`. Converts raw PDF bytes to structural Markdown via
+  DocumentStream -> DocumentConverter.convert -> document.export_to_markdown().
+  The DocumentConverter is built lazily and cached on the module (`_converter`)
+  so a long-lived worker loads the ML models only once.
+- Added an `if __name__ == "__main__"` test harness: parses a local `test.pdf`,
+  prints stats (bytes, parse time, char count), and writes the full Markdown to
+  `test_output.md` for eyeballing LaTeX/table/heading fidelity. Run with
+  `python -m app.ingest.parse` from backend/.
+
+Why:
+- Build order step 2 of PHASE4_PLAN_v2: hide the parser behind a `parse()`
+  interface so chunk/embed never depend on Docling internals. Docling chosen
+  over LlamaParse (local, no per-page cost, strong on STEM/LaTeX/tables).
+
+Notes / gotchas:
+- Windows + Docling/torch spawn worker processes; spawned children re-import the
+  main module. The test body is under the __main__ guard and calls
+  multiprocessing.freeze_support() so it doesn't re-execute in children.
+- Docling import is deferred into functions (not module top-level) to keep import
+  cheap and avoid spawn side-effects when the worker merely imports the module.
+- Verified: `from app.ingest import parse` imports cleanly. End-to-end parse of a
+  real PDF is left for the user to run via the test.pdf harness.
+
+
+2026-05-28 — Removed pydantic from the backend app (backend/app)
+================================================================
+
+What:
+- config.py: replaced pydantic-settings BaseSettings with a frozen stdlib
+  @dataclass populated from os.environ (via python-dotenv). Added small _required
+  and _bool helpers for required vars and bool coercion. The `cors_origins_list`
+  property is gone; the field is now just `cors_origins` (already a list).
+- main.py: updated the one reference from settings.cors_origins_list -> cors_origins.
+- auth.py: dropped BaseModel / EmailStr / Field. Request bodies are now read with
+  request.json() and validated by hand (_read_credentials, regex email check,
+  password length check -> still 422 on bad input). Responses are plain dicts built
+  by _user_dict, which lists fields explicitly so the argon2 hash can never leak
+  (previously response_model=UserOut did that filtering). Endpoints take Request/
+  Response instead of pydantic payload args.
+- auth.py: fixed a latent logout bug — it now clears the cookie on the injected
+  `response` and returns None, instead of returning a brand-new Response on which
+  the clear had no effect.
+- requirements.txt: removed pydantic-settings and email-validator (no longer
+  imported anywhere in our code). pydantic stays only as a transitive dep of FastAPI.
+
+Why:
+- Requested: rewrite the backend to not use pydantic, keep it simple, readable and
+  compact. "No pydantic" is taken to mean no pydantic in our own code — FastAPI
+  itself still depends on it internally, and dropping FastAPI was not implied.
+
+Verification:
+- `python -c "import app.main; import app.worker"` imports cleanly; settings load
+  with correct types (jwt_expiry_minutes:int, cookie_secure:bool).
+- scripts/check_auth.py: all 9 end-to-end auth checks pass against the live DB.
+- Confirmed login response body keys are exactly {id,email,settings,created_at}
+  (no hashed_password leak) and that bad email / short password still return 422.
+
+Note: without response_model, request/response bodies no longer appear in the
+OpenAPI schema /docs. Acceptable trade-off for the "keep it simple" goal.
+
+
+2026-05-28 — Wrote PHASE4_PLAN.md (ingestion + global-query retrieval design)
+============================================================================
+
+What:
+- New planning doc at project root (PHASE4_PLAN.md). Merges old Phase 4 (ingest)
+  and Phase 5 (retrieval) on purpose, capturing a design discussion.
+- Pipeline: upload -> bucket + documents row + enqueue; worker ingest_document
+  (Docling parse -> structure-aware markdown chunking w/ ltree paths -> embed
+  text-embedding-3-large/halfvec(3072) -> insert); project-level
+  recalculate_projections (display UMAP/PCA/t-SNE + recursive cluster tree).
+- Global queries framed as a route-then-gather problem (intent routing, not
+  retrieval granularity): specific -> pgvector top-k; global -> walk a recursive
+  cluster tree (RAPTOR-like) and gather token-bounded medoid chunks.
+- Start LLM-FREE: TF-IDF cluster labels + centroid/medoid per node, designed so
+  RAPTOR-lite (bounded per-node LLM summaries + embeddings) can be slotted in
+  later without schema rework.
+
+Why:
+- User chose Docling (local/free) over LlamaParse (paid API) for the parser.
+- User wants incremental, step-by-step build and prefers LLM-free global-query
+  retrieval to control cost; proposed recursive clustering (≈ RAPTOR).
+
+Decisions locked: Docling behind a parse() interface; structure-aware chunking;
+project-level clustering separate from display dim-reduction; LLM-free start.
+Open questions captured in the doc (§9): Docling-on-Railway footprint, ltree
+slugging, clustering algo (HDBSCAN/GMM/k-means), tree storage (table vs JSONB),
+per-doc artifact storage, router design, incremental re-ingestion.
+
+================================================================================
+2026-05-31  parse.py: collapse beamer overlay duplicate slides
+================================================================================
+What:
+- Added _dedupe_overlay_slides(markdown) to backend/app/ingest/parse.py and
+  applied it to the export_to_markdown() output inside parse().
+- It splits the Markdown into slide sections (each `## ` H2 = one slide title)
+  and, for any run of CONSECUTIVE sections with the same heading, keeps only the
+  last one. No-op for non-slide PDFs (no consecutive duplicate headings).
+
+Why:
+- A real STEM deck (RLHF lecture) produced every slide 2-4x in a row, once
+  garbled and once clean. Root cause: the PDF is a LaTeX beamer deck. Beamer
+  emits one physical PDF page per incremental reveal (\pause/\onslide/\uncover),
+  so one logical slide = several near-identical pages, all faithfully extracted
+  by Docling.
+- The garbled-vs-clean split is Docling's formula enrichment being inconsistent
+  across these near-identical pages: on partial-overlay pages the equation
+  region often isn't classified as a formula and its glyphs are dumped as
+  scattered plain text ("p ψ RL = p θ ..."); on the final fully-revealed page it
+  is recognised and emitted as clean $$...$$.
+- Keeping the LAST overlay in each run fixes both problems at once: in beamer
+  build order the last page is the fully-revealed slide (a superset of the
+  earlier overlays) AND the copy whose formulas Docling rendered as LaTeX.
+
+Verification (against existing test_output.md, 30-slide RLHF deck):
+- H2 headings 80 -> 56 (24 overlay duplicates dropped); 44,876 -> 30,852 chars.
+- The garbled RLHF equation block is gone; the surviving copy is the clean
+  $$\psi^{*} = \arg\max_{\psi} ...$$ version. Spot-checked the multi-overlay
+  "Aligning LMs with RL" and "RL in 2 slides" sections too — last copy is the
+  clean, complete one.
+
+Note: the LaTeX extraction itself was already as good as Docling gets; the fix
+is deduplication, not better formula parsing. Tradeoff: two genuinely-distinct
+consecutive slides that happen to share a title would be merged (rare in beamer;
+distinct same-title slides are normally non-adjacent).
+
+================================================================================
+2026-05-31  parse.py: move overlay dedup BEFORE the model pass (speed)
+================================================================================
+What:
+- Added _strip_overlay_pages(pdf_bytes) -> pdf_bytes, called at the top of
+  parse() before Docling runs. Uses pypdfium2 text extraction only (no ML, near
+  instant) to detect beamer overlay build-ups and rebuild a trimmed PDF with
+  only the final page of each run, so Docling's slow per-page models (layout,
+  TableFormer, CodeFormula) run on ~1/3 the pages for a beamer deck.
+- Decision rule (per user): directional token containment with slack. Drop page
+  N if >= 90% of its tokens (multiset) reappear on page N+1 -> it's an earlier
+  overlay of the same slide. Helpers: _page_tokens, _containment,
+  _overlay_keeper_indices. Threshold const _OVERLAY_CONTAINMENT_THRESHOLD=0.90.
+- Best-effort: any pypdfium2 error falls back to the original bytes (never blocks
+  ingestion); returns original bytes unchanged when nothing is dropped.
+- Kept the existing markdown-level _dedupe_overlay_slides as a cheap SAFETY NET
+  for residual dupes; reworded its call-site comment to say so.
+
+Why:
+- Profiling discussion: the slow part of local parsing is 3 CPU ML models run
+  per *page*. Beamer emits one physical page per \pause reveal, so a 30-slide
+  deck can be 80+ pages -> we were paying model cost ~3x. The post-hoc markdown
+  dedup (added earlier today) removed the duplicate *text* but only AFTER the
+  models already ran. Stripping overlay pages up front removes the wasted compute
+  itself.
+- Beamer PDFs are born-digital VECTOR text (glyphs with codepoints+positions),
+  so page text is extractable instantly with pypdfium2 -- no models needed just
+  to compare pages. (The models are still needed for what they uniquely do:
+  CodeFormula reconstructs equation LaTeX from glyphs that extract as scattered
+  text; TableFormer recovers table grids. Those run on the surviving pages.)
+
+Design note / accepted tradeoff:
+- The subset rule can merge two genuinely-distinct adjacent slides if the earlier
+  one's full text is ~contained in the later one. Rare for real decks; intended
+  behavior for overlays. User chose "strict subset but ~90%, allow imperfection".
+
+Verification (no source test.pdf present, so unit-tested the logic):
+- _overlay_keeper_indices folds overlay runs to the final page; keeps distinct
+  non-subset slides (containment 0.0); reflow of 1/12 tokens = 0.917 still drops;
+  empty/title-only intermediate page folds in (containment 1.0).
+- _strip_overlay_pages roundtrip: 4-page PDF of empty pages -> trimmed to 1 valid
+  page. Fallback path returns original bytes on error.
+
+Not done (flagged as separate optional wins): OCR is default-ON (do_ocr=True) but
+useless on born-digital decks -- could disable for speed, but would break scanned
+PDFs, so left as a conscious decision for later. GPU acceleration also pending.
+
+================================================================================
+2026-05-31  parse.py: add fast text-extraction backend, make it the default
+================================================================================
+What:
+- parse() now dispatches on a new `use_models: bool = False` flag:
+    * use_models=False (DEFAULT): _extract_text_fast() — pypdfium2 native-text
+      extraction only, no ML. ~0.2s for the 75-page test deck.
+    * use_models=True: _parse_with_models() — the unchanged full Docling pipeline
+      (layout + table + formula->LaTeX). Renamed from the old parse() body; all
+      its logic (incl. _strip_overlay_pages page-strip) preserved untouched.
+- _extract_text_fast: extracts each page's text, reuses _overlay_keeper_indices
+  to drop beamer \pause overlay pages, light-formats via _format_page_markdown
+  (drop "N/M" slide-number line, first line -> ## H2 title, ▶/• bullets -> "- "),
+  then runs _dedupe_overlay_slides as a safety net.
+- Added _format_page_markdown + _SLIDE_NUMBER_RE + _BULLET_GLYPHS; added `import re`.
+- Test harness: `python -m app.ingest.parse` runs fast backend; add `--models`
+  for Docling. Now reads test.pdf from the module dir (app/ingest/test.pdf, where
+  the user moved it) and writes test_output.md / test_output_models.md.
+
+Why:
+- User decision: prioritise instant+free ingest now over faithful math. "LLMs can
+  reason between the lines" — the raw equation glyph tokens (argmax, U, beta, log,
+  RL, PT) all survive in the text, enough for retrieval + LLM reasoning. The slow
+  model pipeline (216s CPU, dominated by CodeFormula at 6-11s/equation) is kept as
+  an opt-in for when LaTeX/table fidelity matters (and is the path that benefits
+  from GPU later).
+- Dedup logic we built earlier is reused, not duplicated: page-level keeper
+  indices (_overlay_keeper_indices) shared by both backends; markdown-level net
+  (_dedupe_overlay_slides) shared too.
+
+Result (fast backend on test.pdf, 75 pages):
+- 0.2s (vs 225.6s model path) ~ 1100x faster. 27 overlay pages dropped (75->48),
+  41 H2 slides. RLHF slide appears once; equation rendered as plain glyph text
+  (e.g. "ψ ∗ = argmax ψ X y∈S Uϕ(y,x)−β log( p RL ψ (y|x) p PT (y|x) ) !").
+- Known limitation (accepted): figure-only slides yield just their title (no text
+  layer to extract); tables flatten to text. Use --models / use_models=True for
+  faithful equations + tables; GPU is the way to make that path fast in prod.
+
+================================================================================
+2026-05-31  chunk.py: structure-aware Markdown chunker (Phase 4, step 3)
+================================================================================
+What:
+- New sibling package backend/app/chunk/ (separate from app/ingest/, per user
+  request) with __init__.py and chunk.py. Pure module: Markdown in,
+  list[Chunk] out. No DB / network / embeddings (the worker persists).
+- chunk(markdown, *, doc_slug) -> [Chunk]. Chunk = dataclass(chunk_index,
+  content_full, content_sparse, path[ltree str], heading_trail, token_count).
+- Added tiktoken>=0.7 to requirements.txt (installed 0.13 into venv). Token
+  counts use o200k_base (matches text-embedding-3-large); falls back to a
+  word-count*1.3 estimate if tiktoken is missing so chunking never hard-deps it.
+- Three stages:
+  1. _split_sections: walk the heading stack into heading-scoped sections.
+     Slug labels resolved HERE with sibling dedup (Example -> example, example_2)
+     so downstream is collision-free. ``` fences tracked so a '#' inside code
+     isn't read as a heading. Solves the §6 ltree-slug open question.
+  2. _atomize: split a section body into paragraph atoms on blank lines, but
+     keep $$...$$ math blocks and ``` fences WHOLE -> an equation is an
+     indivisible unit (per user's hard requirement).
+  3. _pack: greedy 400-800 token packing. While a chunk is under MIN it keeps
+     merging across sibling sections (coalesces tiny slides); once >= MIN it
+     flushes on a MAX overflow OR a new section. A single atom > MAX (long
+     equation) becomes its own oversized chunk -- never split.
+- content_sparse: regex + stopword compression. Math spans stashed behind \x00n\x00
+  placeholders before the prose pass (so a stopword strip can't touch LaTeX),
+  restored after. Headings / table rows / block-math lines kept verbatim;
+  prose/bullets keep bold, numbers, Capitalised terms and symbols, drop only
+  lowercase stopwords. spaCy/TextRank deferred (documented upgrade lever).
+- Manual harness: python -m app.chunk.chunk reads app/ingest/test_output.md and
+  prints chunk count, token min/median/max, compression ratio, sample paths.
+
+Why:
+- Build-order step 3 of PHASE4_PLAN_v2. Keeping it pure + deterministic makes it
+  unit-testable and keeps Docling/embedding concerns out of the chunker.
+
+Design fix found via the harness (worth recording):
+- v1 used a "never merge across the top-level (H1) heading" rule and set each
+  chunk's path to the group's common-ancestor. On the test deck (parser promotes
+  every slide to a bare H2, no H1) this degenerated: every slide looked like its
+  own top-level -> 41 tiny chunks (median 51 tok), and common-ancestor of any
+  merged flat slides collapses to the bare root, erasing ltree granularity.
+- Fix: (a) coalesce sibling sections until MIN_TOKENS; (b) set path/trail to the
+  section the chunk STARTS in (a specific leaf) instead of the common ancestor.
+  Result on the deck: 41 -> 8 chunks, median 453 tok (in-band), specific paths.
+
+Verification:
+- Harness: 8 chunks, tokens min53/median453/max529, paths like
+  test.dpo_direct_preference_optimization. 13% sparse reduction on THIS deck is
+  expected-low (slides are already terse: mostly headings+bullets we keep);
+  prose textbooks will compress far harder.
+- Synthetic tests pass: a 900-term $$...$$ block stays in ONE 5415-token chunk
+  (never split, allowed to exceed MAX); inline $a is to b$ survives the stopword
+  pass intact; sibling '## Example' x2 -> example / example_2.
+- Known cosmetic edge: a title-only H1 immediately followed by content gives the
+  chunk the H1's path (its heading atom leads the chunk), shadowing the child's
+  label. Accepted -- the chunk genuinely spans from the H1 into the child.
+
+================================================================================
+2026-05-31  chunk.py: derive the chunk-boundary heading level (pivot), not H1
+================================================================================
+What:
+- Replaced the hard-coded "boundary = H1" assumption with a measured pivot level.
+  New _pick_pivot(atoms) -> int | None and _pivot_key(); _pack now takes a pivot.
+- "Depth" = heading STACK NESTING depth, not the Markdown heading number, so a
+  deck of bare ## slides (no H1) is depth 1, exactly like a textbook's top
+  chapters. Level-agnostic by construction.
+- _pick_pivot: for each nesting depth present, group atoms into the contiguous
+  sections that depth would yield and score the grouping by |median_section_size
+  - target|, target = geomean(MIN,MAX) ~566. Closest depth wins. Fall back to
+  flat (None) only when the best median is < MIN/2 (=200): every structural level
+  over-segments (e.g. ~50-token slides). No headings -> None too.
+- _pack(atoms, pivot): close a group when the atom crosses a pivot boundary OR
+  (>=MIN and would exceed MAX). Boundary is the transition between CONSECUTIVE
+  atoms' pivot keys (not vs the group's first atom) so a stub ancestor heading
+  (bare '# Chapter 2', < _STUB_TOKENS=16) is absorbed into the next section
+  instead of splitting on every paragraph. Flat mode (pivot=None) has no
+  boundaries -> tiny slides coalesce to the band; equations still never split.
+
+Why:
+- User feedback: keying on H1 overfits, and this deck has NO H1 (parser promotes
+  each slide to ##). Wanted a measure that's "not too coarse, not too granular,
+  with a fallback to plain text". Pivot-by-median-closeness-to-target delivers
+  that and is derived per-document.
+
+Two bugs found + fixed during this change (via the harness):
+1. First gate was median < MIN (400): rejected a textbook's good 360-token
+   section level and went flat, producing chunks that crossed chapter
+   boundaries. Loosened to MIN/2.
+2. Comparing each atom's pivot key against the GROUP'S FIRST atom broke once a
+   stub heading rode forward: the stub's key (the chapter) never matched any
+   child section, so it split on every paragraph (133/260/388...). Fixed by
+   comparing CONSECUTIVE atoms instead.
+
+Verification (synthetic + real):
+- Slide deck (test_output.md): pivot -> flat; 5 chunks, 542-793 tok (was 41 tiny
+  with the old H1 rule, then 8). Compression 13% (expected-low for terse slides).
+- Synthetic 3xH1 / 3xH2 / 2xH3 textbook: pivot -> depth 2 (sections); 9 chunks
+  ~388 tok with clean book.chapter_0.section_0_1 paths; chapter heading absorbed
+  into its first section (no stub chunks).
+- 700-term $$...$$ block: stays in exactly 1 chunk in both flat and pivot modes.
+
+================================================================================
+2026-05-31  embed.py: batched embeddings via OpenRouter (Phase 4, step 4)
+================================================================================
+What:
+- New sibling package backend/app/embed/ (alongside ingest/ and chunk/) with
+  __init__.py and embed.py. One async entry point:
+  embed(texts: list[str]) -> list[list[float]], one 3072-dim vector per input,
+  in input order. Exposes EMBED_DIM=3072 and EmbedError.
+- Uses raw httpx (already a dep) against the OpenAI-compatible /embeddings route,
+  model openai/text-embedding-3-large. No OpenAI SDK -> stays thin + unified.
+- config.py: added openrouter_key (required, from existing OPENROUTER_KEY),
+  embed_base_url (default https://openrouter.ai/api/v1) and embed_model (default
+  openai/text-embedding-3-large). Base URL/model are env-overridable so the
+  endpoint can be repointed at OpenAI without code changes.
+- Batches inputs (_BATCH_SIZE=96), token-truncates any pathological input to
+  ~8000 tokens (tiktoken, lazy, char-clip fallback) so one huge chunk can't get
+  the whole batch rejected, sorts the response by index (API may reorder), and
+  validates count + dim. Retries 429/5xx/network up to 4x with 1/2/4/8s backoff.
+- Manual harness: python -m app.embed.embed embeds 3 sentences and prints cosine
+  similarities + dims, doubling as a live endpoint check.
+
+Why:
+- Build-order step 4. User wants OpenAI 3-large but routed through OpenRouter so
+  all model traffic uses one key. Kept embedding behind embed() so the worker
+  (and future query path) never touch HTTP/provider details, mirroring how
+  parse() and chunk() hide their internals.
+
+Verification (LIVE call, user's key):
+- POST https://openrouter.ai/api/v1/embeddings -> 200 OK; 3 vectors of dim 3072.
+- Semantics sane: related sentences (backprop/gradients) cosine 0.569 vs
+  unrelated (cat on windowsill) 0.043.
+- NOTE: OpenRouter DOES proxy /embeddings now (it historically didn't). The
+  EMBED_BASE_URL escape hatch stays in case that regresses, but no swap needed.
+
+================================================================================
+2026-05-31  library/: bucket storage + project/document upload API (step 6)
+================================================================================
+What (pulled step 6 ahead of step 5 so the worker has real files to ingest):
+- New feature package backend/app/library/ groups the source-document concern so
+  app/ root stays uncluttered (user pref): storage.py, projects.py, documents.py.
+- storage.py: thin async wrapper over the S3-compatible bucket. boto3 is sync, so
+  every call runs via asyncio.to_thread; one lazily-built, cached client per
+  process, shared by web + worker. upload_bytes(key,data,ct) and
+  download_bytes(key) (the latter for the ingest worker, step 5).
+- projects.py: APIRouter /projects — POST (create) + GET (list), auth-protected,
+  scoped to current_user. A project is the unit documents attach to.
+- documents.py: APIRouter /projects/{project_id}/documents — POST upload
+  (multipart UploadFile) + GET list. Verifies project ownership (404 otherwise),
+  enforces PDF-only (415) and a 50 MB cap (413), rejects empty (422). Generates
+  the document UUID in Python so the bucket key embeds it
+  (documents/{project}/{document}/{name}), uploads, inserts a documents row
+  (status defaults to {"state":"uploaded"}), returns it. Left a one-line TODO to
+  enqueue ingest_document in step 5.
+- main.py: registered both routers. requirements.txt: added python-multipart
+  (FastAPI needs it for UploadFile); installed into venv.
+
+Why:
+- Need files physically in the bucket before the worker (download -> parse ->
+  chunk -> embed) can be tested. Upload endpoint is the natural first half.
+
+Verification (LIVE, against real DB + bucket):
+- storage round-trip: upload/download/delete a tiny object on bucket
+  customizable-rack-xdygsu -> OK.
+- End-to-end via FastAPI TestClient: register 201 -> create project 201 ->
+  upload the 19 MB app/ingest/test.pdf 201 (status uploaded, key embeds ids) ->
+  list 200 (count 1) -> non-PDF rejected 415. The test.pdf now lives in the
+  bucket, ready for step 5's ingest worker.
+
+================================================================================
+2026-05-31  worker: wire ingest_document end-to-end (step 5) + migration 0002
+================================================================================
+What:
+- Migration 0002 (applied to live DB): chunks.content -> content_full; add
+  chunks.content_sparse TEXT; new clusters table (id, project_id, parent_id,
+  level, label, centroid halfvec(3072), medoid_chunk_id, member_count) with
+  project/parent indexes. Matches PHASE4_PLAN_v2 §3. (Postgres auto-rewrites the
+  dependent FTS index expression on the column rename.)
+- worker.ingest_document now implemented: load doc row -> status "parsing" ->
+  storage.download_bytes -> parse() (fast path) -> chunk() -> status "embedding"
+  -> embed() -> transactional DELETE+executemany INSERT of chunks -> status
+  "ready". parse()/chunk() are sync+CPU so they run via asyncio.to_thread. On any
+  error: status "error" with message, then re-raise so ARQ marks the job failed.
+  _set_status helper writes the status JSONB the UI polls.
+- Chunk insert: embedding passed as a plain list[float] (pgvector asyncpg codec
+  HalfVector._to_db_binary wraps a list, registered in db._init_connection); path
+  cast $6::ltree, metadata $7::jsonb (heading_trail + token_count). Idempotent:
+  clears prior chunks for the doc first, so re-ingest is safe.
+- ARQ enqueue deliberately NOT wired yet (user choice): no Redis needed to test.
+  Added a __main__ harness: `python -m app.worker [document_id]` runs
+  ingest_document directly (picks the latest document if no id), then prints the
+  resulting status + first chunks (index, token_count, emb present, lengths,
+  path). The documents.py upload still carries a one-line enqueue TODO.
+
+Why:
+- Build-order step 5, minus the queue. Running the job function directly is
+  identical to what ARQ would invoke, so the pipeline is fully testable now and
+  the Redis enqueuer can be added later without touching ingest logic.
+
+Verification (LIVE end-to-end on the uploaded 19 MB test.pdf):
+- download -> parse (fast path dropped 27 overlay pages, 75->48) -> chunk (flat
+  mode, 41 atoms -> 8 chunks) -> embed (OpenRouter 200) -> insert -> status
+  {"state":"ready","chunks":8}.
+- All 8 rows have embedding NOT NULL, ltree paths (test.rl_in_2_slides_2 etc.),
+  content_full + content_sparse, token_count in metadata. Sizes 223-498 tok,
+  honoring the user's tightened MIN/MAX=200/500. Sparse is ~10-25% shorter than
+  full on these terse slides (bigger wins expected on prose).
+
+================================================================================
+2026-05-31  jobs.py: wire the ARQ enqueuer (web producer side)
+================================================================================
+What:
+- New app/jobs.py = the PRODUCER side of ARQ (used by the FastAPI web process),
+  mirroring db.py's pool pattern: create_redis_pool / close_redis_pool /
+  get_redis, plus enqueue_ingest(document_id) -> enqueue_job("ingest_document",
+  str(id)). Pool is an ArqRedis from arq.create_pool(RedisSettings.from_dsn(...)).
+  Close uses aclose() (redis-py 5.x).
+- main.py lifespan now also opens/closes the redis pool alongside the db pool.
+- library/documents.py upload endpoint: replaced the TODO with
+  `await enqueue_ingest(document_id)` after the DB insert, before returning.
+
+How it works (architecture, for future me):
+- TWO processes, one Redis. Web (uvicorn app.main:app) only PUSHES a job (fn name
+  + document_id) to Redis and returns 201 immediately — it never runs the heavy
+  pipeline. The WORKER is a separate long-running process started with the CLI
+  `arq app.worker.WorkerSettings` (NOT a FastAPI app, no HTTP); its startup hook
+  gives it its own DB pool via ctx, it blocks on Redis, pops jobs, and runs
+  ingest_document. On Railway that's two services off the same repo (one uvicorn,
+  one arq); locally two terminals. They share nothing but Redis.
+- Burst mode: `arq app.worker.WorkerSettings --burst` drains the queue then
+  exits — handy for tests/one-offs.
+
+Verification (LIVE full producer->Redis->consumer path):
+- HTTP upload of test.pdf -> 201, status {"state":"uploaded"} (web did NOT
+  process; job sat in Redis).
+- `python -m arq app.worker.WorkerSettings --burst` -> picked up
+  ingest_document('b896ab66...') and ran it (~9.8s).
+- DB after: documents.status {"state":"ready","chunks":8}; 8 chunks, all 8 with
+  embedding NOT NULL. End-to-end queue path works.
+
+Note: an earlier direct-call run (python -m app.worker) and the check scripts use
+a one-off psql-ish inline python; embedded-quote SQL in the shell is fragile on
+Windows — prefer a small temp .py file when querying ad hoc.
+
+================================================================================
+2026-05-31  projections: recalculate_projections (step 7) — UMAP/PCA/t-SNE
+================================================================================
+What:
+- New sibling package backend/app/projections/ with a pure compute(vectors) ->
+  {"umap_2d","umap_3d","pca","tsne"} (each an (N,k) numpy array or None). Lazy
+  imports (umap-learn pulls numba) so importing the module stays cheap.
+  Deterministic (_SEED=42) so the UI doesn't reshuffle; metric="cosine" for UMAP
+  (matches how the embeddings are searched). Adaptive params + per-method
+  try/except: PCA for N>=2; UMAP/t-SNE only for N>=_MIN_FOR_MANIFOLD=4 with
+  n_neighbors=min(15,N-1) and perplexity=min(30,max(2,(N-1)/3)); any method that
+  can't run yields None -> SQL NULL.
+- worker.recalculate_projections implemented: SELECT all project chunks with a
+  non-null embedding (join documents on project_id), build the (N,3072) matrix
+  from the decoded HalfVector rows (.to_numpy()), run compute() in a threadpool,
+  executemany UPDATE of umap_2d/umap_3d/pca_coords/tsne_coords (existing JSONB
+  cols) via _coord_json(). Project-wide by design: a new doc moves every point.
+- ingest_document now enqueues recalculate_projections(project_id) on success via
+  the worker's own ctx["redis"] (guarded: absent in the direct-call harness).
+- jobs.py: added enqueue_projections() for the web side (parity; not yet called
+  from an endpoint). requirements.txt: scikit-learn, umap-learn (installed).
+- worker __main__ harness extended: after ingest it runs recalculate_projections
+  for the doc's project and prints sample coords.
+
+Why:
+- Build-order step 7 / PRD projection page. Coordinates are precomputed in the
+  background so the SvelteKit frontend just fetches them. Chunks exist (with
+  embeddings) before coords are written — coords are null until this job runs,
+  which the UI treats as "not plotted yet" (answered the user's question).
+
+Verification (LIVE, the test.pdf project, 8 chunks):
+- ingest -> ready(8) -> recalculate_projections wrote coords for all 8 chunks.
+  Sample row: umap2d {x:13.4,y:11.7}, umap3d {x,y,z}, pca {x,y}, tsne {x,y}. All
+  four methods populated; values sane/distinct.
+- Perf note: first run ~32s, almost all of it UMAP's one-time numba JIT compile
+  (only 8 points); amortized after and it's background work. sklearn/umap emit
+  small-sample warnings (perplexity, n_jobs w/ random_state) — harmless.
+- Not re-verified through the full ARQ burst chain this time (ingest-enqueue was
+  already proven live earlier, and the projections enqueue is the same
+  enqueue_job pattern); skipped to avoid a redundant ~40s re-ingest + API call.
+
+================================================================================
+2026-05-31  clusters: single-level HDBSCAN clustering (step 8)
+================================================================================
+What (user scope: single level for now, NOT recursive yet — the clusters table
+already has parent_id/level so recursion needs no migration later):
+- New sibling package backend/app/clusters/ with pure
+  compute_clusters(vectors, sparse_texts) -> list[ClusterResult]. ClusterResult =
+  member_indices, medoid_index, centroid(list, original 3072-d), label, count.
+- Approach (PHASE4_PLAN_v2 §2.C): cluster in a MID-DIM space (UMAP n_components=
+  min(10,N-2), cosine) because density clustering is unstable in 3072-d, but
+  compute centroid (mean) + medoid (member with max cosine sim to centroid) back
+  in the ORIGINAL space so they're comparable to query vectors. HDBSCAN
+  (sklearn.cluster.HDBSCAN — already in scikit-learn 1.5, no new dep) auto-picks
+  k; min_cluster_size=2. Noise (-1) dropped; if HDBSCAN finds only noise OR
+  N<_MIN_FOR_REDUCE(4), fall back to one cluster so a project always has a node.
+- Labels: TF-IDF (sklearn TfidfVectorizer, english stopwords) over each cluster's
+  concatenated content_sparse; top 4 terms. Best-effort: 'cluster N' fallback if
+  text too thin.
+- worker.recalculate_clusters(ctx, project_id): load project chunks (id,
+  embedding, content_sparse), compute in a threadpool, then in one transaction
+  DELETE the project's old clusters and executemany INSERT new rows
+  (parent_id=NULL, level=0, centroid as list -> halfvec codec, medoid_chunk_id =
+  ids[medoid_index]). Registered in WorkerSettings.functions.
+- ingest_document now enqueues recalculate_clusters alongside recalculate_
+  projections (via ctx['redis']). jobs.enqueue_clusters added for web parity.
+  worker __main__ harness extended to run + print clusters.
+
+Why:
+- Build-order step 8. User decided one level of automatic clustering (HDBSCAN) is
+  enough for now over a full recursive tree; centroid/medoid/TF-IDF feed step 9's
+  global-query router (medoid sampling) and the map UI.
+
+Verification (LIVE, the 8-chunk test.pdf project):
+- recalculate_clusters -> 2 clusters, both with centroid stored:
+    [5] "data, gpt, ai, human"   medoid=...why_rlhf_2_negative_feedback
+    [3] "ˆyθ, yi, logpθ, pθ"      medoid=...aligning_language_models_with_reinforcem
+  Semantically clean split: cluster 2 captured the math-heavy RLHF formula chunks,
+  cluster 1 the conceptual ones.
+- Known cosmetic: math glyphs (ˆyθ, logpθ) leak into labels from the plain-text
+  equations in content_sparse. Descriptive but noisy; could strip non-alpha
+  tokens in _tfidf_labels later. Windows console needs utf-8 reconfigure to print
+  such labels (cp1252 can't encode θ).
+
+================================================================================
+2026-05-31  retrieval: Dynamic Sparse Router (step 9) — token-budget routing
+================================================================================
+What:
+- New sibling package backend/app/retrieval/ with router.py exposing
+  route(project_id, query, *, intent, scope, k, budget) -> RetrievalResult
+  (strategy, context, chunks, token_count, meta). GATHERS context only; it does
+  NOT call the answering LLM (chat layer's job later).
+- New app/llm.py: thin async OpenRouter chat-completions helper complete(messages,
+  model=...). config.py: added llm_base_url (default OpenRouter) + planner_model
+  (default openai/gpt-4o-mini), both env-overridable. Reusable by future chat.
+- Routing (PHASE4_PLAN_v2 §4):
+    intent "specific"                 -> 1 pgvector top-k cosine over content_full
+    intent "global", corpus<=budget   -> 2 brute stuff all content_sparse (ltree-ordered)
+    intent "global", corpus>budget, topic -> 3 agentic ltree skeleton (LLM planner)
+    intent "global", corpus>budget, all   -> 4 medoid sampling from clusters
+  intent/scope default to "auto" keyword heuristics but are overridable (a slash
+  command is unambiguously global). budget (default 15k) is a param so tests can
+  force the large-corpus branches.
+- Corpus size for the decision is estimated cheaply as SUM(length(content_sparse))
+  /4 (chars->tokens) so we never load a huge corpus just to decide not to.
+- Strategy details: (1) embed query, ORDER BY embedding <=> $q::halfvec LIMIT k,
+  returns content_full. (2)/(4) _assemble() concatenates content_sparse blocks
+  (each prefixed [ltree.path]) until the token budget, always keeping >=1 block.
+  (3) fetch DISTINCT path ToC -> cheap LLM picks branches (JSON array, verbatim
+  paths) -> fetch WHERE path <@ ANY($2::ltree[]); on any LLM/parse error it falls
+  back to medoid sampling (meta.fellback_from="skeleton").
+
+Why:
+- Build-order step 9, final ingest/retrieval piece. Global queries embed poorly,
+  so route-then-gather by token budget instead of expensive map-reduce; keeps
+  cost low (sparse text, medoid sampling, cheap planner).
+
+Verification (LIVE, the 8-chunk test.pdf project):
+- specific: top-3 by cosine distance (0.456/0.513/0.523), all RLHF chunks. Good
+  ranking; halfvec <=> operator + list param via $q::halfvec works.
+- stuff: corpus 2545 tok < 15k -> stuffed all 8 chunks (3007 tok context).
+- medoid (forced budget=0, scope=all): pulled a cluster medoid from `clusters`.
+- skeleton (forced budget=0, topic): LLM planner SUCCEEDED (fellback_from=None),
+  selected 3 relevant RLHF ltree branches from the ToC, then path <@ ANY(::ltree[])
+  fetched them. Confirms the asyncpg ltree[] array cast works.
+- Note: budget=0 in the test caps assembly to 1 block (it only forces the branch);
+  real 15k budgets include all medoids/branches.
+
+================================================================================
+2026-05-31  clusters: clean up TF-IDF labels (drop math-glyph noise)
+================================================================================
+What:
+- clusters._tfidf_labels now uses token_pattern r"(?u)\b[a-z]{3,}\b" and a
+  stopword set = sklearn ENGLISH_STOP_WORDS | _MATH_STOPWORDS (log, exp, argmax,
+  theta, phi, sqrt, frac, mathbb, ...).
+Why:
+- User: labels had math glyphs ("ˆyθ, yi, logpθ, pθ"). Root cause: the fast-parse
+  path emits equations as scattered unicode text, which the default tokenizer
+  (\w\w+, unicode) happily captured.
+How it fixes it:
+- The trailing unicode-aware \b means a fragment with a glyph fused to it
+  ("logpθ","pθ","ˆyθ") has NO word boundary mid-run and is rejected outright (not
+  even "logp" leaks). [a-z]{3,} also drops 1-2 letter noise (yi, pθ) and numbers;
+  the math stopwords drop clean-but-unhelpful terms (log, theta, ...).
+Verification (LIVE, same 8-chunk project, re-clustered):
+- [5] "data, gpt, human, models"   (was "data, gpt, ai, human")
+- [3] "model, rlhf, reward, gradient"  (was "ˆyθ, yi, logpθ, pθ")
+  The math cluster now reads as real words and still describes the RLHF-math group.
+
+================================================================================
+2026-05-31  documents: multi-file upload endpoint (POST .../documents/batch)
+================================================================================
+What:
+- Refactored library/documents.py: extracted _store_and_enqueue(project_id, file)
+  (validate PDF/size -> bucket upload -> insert row -> enqueue_ingest) shared by
+  the single-file POST and the new batch endpoint.
+- New POST /projects/{project_id}/documents/batch accepting files: list[UploadFile].
+  Each file runs the full pipeline independently (ingest self-chains projections +
+  clusters). Per-file errors don't abort the batch: returns
+  {"uploaded": [docs...], "errors": [{filename, error}...]}.
+- The single-file POST "" still works (now just calls the helper).
+
+Why:
+- User wants a first outside-facing endpoint to upload multiple PDFs and run the
+  whole flow (bucket -> parse -> chunk -> embed -> cluster -> umap) per doc. It's
+  in the documents router, which main.py already mounts/exposes.
+
+How the "entire flow" runs: the endpoint only UPLOADS + ENQUEUES (returns fast).
+The worker (arq app.worker.WorkerSettings) executes parse/chunk/embed/cluster/umap.
+So to actually process, the worker must be running (or `--burst` to drain once).
+
+Verification (LIVE via TestClient + arq --burst):
+- POST /batch with test.pdf under two names -> 201, uploaded both, errors [].
+- Burst drained: 2x ingest_document -> ready(8 each); then the chained
+  recalculate_projections + recalculate_clusters ran.
+- Final project state: 16 chunks, all 16 embedded, all 16 with umap_2d+umap_3d,
+  12 clusters with clean word labels (gradient/reward/model/preference/...).
+- Note: the 12 clusters are DOUBLED labels — artifact of uploading the SAME pdf
+  twice (identical embeddings -> HDBSCAN pairs each duplicate into its own
+  2-member cluster). Distinct real PDFs won't do this.
+- Known minor inefficiency: a batch of N enqueues N projection + N cluster
+  recomputes (ingest self-enqueues; last wins, correct but redundant). Could
+  debounce/enqueue-once-after-batch later.
+
+================================================================================
+2026-05-31  recompute once per batch via finalize_project (fix the N-recompute)
+================================================================================
+What:
+- ingest_document NO LONGER self-enqueues recalculate_projections/clusters.
+- New worker job finalize_project(ctx, project_id, document_ids, attempts_left=120):
+  counts how many of document_ids are not yet terminal (status state not in
+  ready/error); if any remain it RE-ENQUEUES ITSELF deferred 5s (cooperative wait
+  that frees the worker slot, not a blocking sleep), decrementing attempts_left;
+  once all are terminal (or the ~10min ceiling hits) it enqueues exactly one
+  recalculate_projections + one recalculate_clusters. Registered in
+  WorkerSettings.functions.
+- jobs.enqueue_finalize(project_id, document_ids) added. Upload endpoints now call
+  it: the single POST with [doc_id], the /batch POST once with all uploaded ids.
+
+Why:
+- User: projections + clustering were recomputed once PER document in a batch
+  (because each ingest self-enqueued them). Should happen once, after the LAST
+  doc. ARQ has no native job dependencies, so finalize implements "run after
+  these jobs" by polling the documents' status with deferred self-re-enqueue.
+
+Verification (LIVE, 2-file batch via /batch + arq --burst), exact job trace:
+  ingest_document(a) -> ok
+  ingest_document(b) -> ok
+  finalize_project   -> waiting   (docs still ingesting; re-enqueued deferred)
+  finalize_project   -> finalized (both ready -> enqueue recompute ONCE)
+  recalculate_projections -> ok   (exactly 1)
+  recalculate_clusters    -> ok   (exactly 1)
+So 1 projection + 1 cluster job for the whole batch (was 2 each before).
+
+Gotchas learned:
+- Testing with `timeout N` on the burst worker can KILL an ingest mid-parse,
+  leaving its document stuck in "parsing" forever (ingest's except only fires on
+  a real exception, not a SIGKILL). A stuck doc makes finalize wait its full
+  ~10min ceiling. In normal runs ARQ retries killed jobs and the except sets
+  "error", so docs reach terminal state. Cleaned up the poisoned test docs by
+  marking non-terminal statuses as error. The attempts ceiling is the safety net
+  for genuinely dead docs.
+
+================================================================================
+2026-05-31  chat: grounded ltree-threaded chat endpoint (the core feature)
+================================================================================
+Refactors first (user-approved structure):
+- retrieval/router.py -> retrieval/retrieval_router.py (disambiguate from FastAPI
+  APIRouter; route() is a strategy picker, not an HTTP router). Updated __init__.
+- llm.py stays top-level (shared infra: retrieval planner + chat answering).
+- config.py: added chat_model (default openai/gpt-4o, env CHAT_MODEL), distinct
+  from the cheap planner_model.
+
+What (new package app/chat/ with chat.py = APIRouter, mounted in main.py):
+- A chat is a tree of `messages` rows sharing chat_id; the path ltree gives
+  reddit-style nesting for free (the messages table existed since 0001, unused
+  until now).
+- POST /projects/{pid}/chats/{chat_id}/messages  body {content, parent_path?,
+  intent?, scope?}:
+    1. pick parent = explicit parent_path, else the chat's latest message
+       (linear continuation), else root;
+    2. history = ancestor branch of parent (WHERE path @> parent, role in
+       user/assistant);
+    3. insert user msg at next child path (_next_child_path via nlevel + <@);
+    4. retrieval.route(content, intent, scope) -> grounding context + citations;
+    5. llm.complete(system + sources + history + question, model=chat_model);
+    6. insert assistant msg as child, citations/strategy in metadata;
+    7. return {user_message, assistant_message, citations}.
+  GET .../messages (tree order by path) and GET .../chats (list, last active) too.
+- DB held only for quick inserts; the network calls (embed/LLM) run between two
+  acquire() blocks. jsonb metadata is json.dumps on write, json.loads on read
+  (no jsonb codec registered -> asyncpg returns it as str).
+- Non-streaming for now (SSE streaming is the planned follow-up). Slash commands
+  (/deepsummary etc.) will later just set intent=global; not wired yet.
+
+Why: this is the most important NotebookLM-style capability (chat with sources)
+and nothing connected retrieval + llm + message persistence before.
+
+Verification (LIVE end-to-end via TestClient + arq --burst on test.pdf):
+- upload 201 -> worker ingested -> POST chat 201.
+- retrieval strategy "specific" (pgvector top-k); citations = the relevant RLHF
+  chunk paths. Answer was grounded + accurate and cited
+  [rlhf.rlhf_reinforcement_learning_with_human_f] etc.
+- ltree threading correct: user msg path "1", assistant reply "1.1".
+
+Known/deferred: no streaming yet; history is untruncated (could blow context on
+long chats); _owned_project is duplicated across documents.py/chat.py (candidate
+to factor into a shared dep later); concurrent posts to one chat could race on
+the sibling-path count (fine for single-user, add an advisory lock later).
+
+================================================================================
+2026-05-31  preferences: unified user-settings layer (per-user, JSONB-stored)
+================================================================================
+What:
+- New package app/preferences/ = single source of truth for every user-tunable
+  inference knob. preferences.py defines Preferences dataclass + SCHEMA (per-field
+  type/default/min/max/choices/description) + resolve() + validate() + describe().
+  Fields: chat_model, temperature, top_p, top_k, max_tokens, system_prompt,
+  retrieval_budget, retrieval_k, default_intent, default_scope. The default system
+  prompt now lives here (DEFAULT_SYSTEM_PROMPT), moved out of chat.py.
+- 3-layer resolution: hardcoded DEFAULTS <- user's stored settings <- per-request
+  overrides; every value type-checked + CLAMPED to schema bounds. resolve() is
+  lenient (ignores bad/unknown entries); validate() (for PUT) raises on bad
+  type/choice but clamps numbers. Model defaults that come from env (chat_model)
+  are callables in SCHEMA so they track config.
+- Storage: users.settings JSONB (existing column, no migration). api.py adds
+  GET /settings (effective + raw overrides + schema) and PUT /settings (validate
+  patch -> merge -> store). Mounted in main.py.
+- Wired consumers: chat.send_message now resolves prefs from
+  current_user["settings"] + an optional body {"settings": {...}} override, and
+  uses prefs for system_prompt / chat_model / temperature / max_tokens + passes
+  retrieval_k / retrieval_budget / intent / scope into route(). The hardcoded
+  max_tokens=2000, temperature=0.3, _SYSTEM_PROMPT, model are GONE from chat.py.
+  llm.complete() gained top_p / top_k pass-through (only sent when set).
+
+Bug fixed along the way (was masked):
+- asyncpg returns jsonb as a STR (no codec registered), so auth._user_dict's
+  `settings if isinstance(dict) else {}` always yielded {} -> stored user settings
+  would never load. Fixed _user_dict to json.loads the settings string. (Didn't
+  register a global jsonb codec on purpose: existing inserts pass json.dumps(...)
+  strings with ::jsonb casts, and an encoder codec would double-encode them.)
+
+Deliberately excluded (user agreed): ingestion-time knobs (chunk MIN/MAX,
+embedding model/dims, cluster params) — they change stored artifacts + need
+re-ingestion, and 3072 dims are schema-baked. Stay global config for now.
+
+Verification (LIVE):
+- Unit: defaults (temp 0.3, max 2000, model openai/gpt-4o); stored override +
+  clamp (max_tokens 999999 -> 8000); per-request override beats stored (0.1);
+  garbage stored value ignored (temp falls back to 0.3); validate rejects bad
+  choice, clamps numbers.
+- HTTP (TestClient): GET /settings -> defaults + 10-field schema. PUT with
+  {temperature:0.7, max_tokens:999999, chat_model:claude-3.7, bogus:1} ->
+  clamped to 8000, dropped bogus, stored. GET again -> persisted AND loaded back
+  through auth (jsonb parse fix). PUT {default_intent:"nonsense"} -> 422.
+
+================================================================================
+2026-05-31  citations: numbered-footnote [S#] tracking (which chunks were used)
+================================================================================
+Approach chosen (over JSON output or a 2nd cheap model): number the retrieved
+sources [S1],[S2],... in the context and have the model cite them inline like a
+footnote; parse [S#] out of the answer to learn which chunks it actually used.
+Rationale: least distracting (footnote citing is natural answer-writing, not an
+out-of-band data task), LaTeX-safe (no escaping prose-with-backslashes into JSON),
+streaming-friendly (inline markers stream fine), and chunk-precise (S# -> one
+chunk id). JSON/2nd-model kept as possible future "strict" mode.
+
+What:
+- retrieval_router.py: every strategy now carries the chunk id, and the context
+  is formatted as numbered blocks "[S{n}] (path)\n<text>" via new _number_context()
+  / rewritten _assemble(). Added c.id / ch.id to all four SELECTs. chunks[i] is
+  source S{i+1}.
+- preferences.DEFAULT_SYSTEM_PROMPT: now tells the model the sources are numbered
+  [S1],[S2],... and to cite inline as [S#] after the claim it supports (replaced
+  the old "[doc.section] path label" instruction). Still user-editable.
+- chat.send_message: parses the answer with _CITE_RE = r"\[S(\d+)\]", maps numbers
+  -> chunk ids via retrieval.chunks order (dedup, bounds-checked), and stores
+  metadata = {strategy, retrieval_tokens, retrieved:[{id,path}...all],
+  cited:[{id,path}...used]}. Response returns {user_message, assistant_message,
+  cited, retrieved}. Fallback: model cites nothing -> cited=[] (never faked).
+
+Why: the inline note at chat.py:156 — not every retrieved chunk is actually used;
+the UI wants "consulted" (retrieved) vs "used" (cited).
+
+Verification (LIVE end-to-end, test.pdf, chat about RLHF reward model):
+- Model wrote natural footnotes: "...positive and negative signals [S1][S2]." and
+  "...human judgments [S2][S7]." with intact KaTeX ($U_\phi(y,x)$).
+- retrieved=8 (all), cited=3 distinct chunks (S1,S2,S7 deduped to unique ids+paths).
+  S# -> chunk-id mapping + dedupe confirmed correct.
+
+================================================================================
+2026-05-31  chat commands: /mockexam (single-pass formatting command) + /commands
+================================================================================
+What:
+- New app/chat/commands.py: a Command = {name, description, instructions
+  (preprompt appended to the system prompt), intent?/scope? overrides, parse?
+  (answer -> structured metadata)}. COMMANDS registry + get()/describe(). Only
+  single-pass formatting commands live here.
+- /mockexam command: instructions ask the model to emit each question in a strict
+  triple-marker template
+      <<<Q>>> question (+ (A)(B)(C)(D))  <<<A>>> worked answer, cites [S#]  <<<END>>>
+  and _parse_mockexam regex r"<<<Q>>>(.*?)<<<A>>>(.*?)<<<END>>>" (DOTALL) ->
+  {"exam":[{question,answer}...]}. Plain-ASCII markers are LaTeX-safe and
+  unambiguous; the frontend hides each answer behind a toggle. intent="global"
+  so the exam covers the material broadly.
+- chat.send_message wiring (kept thin): body.command -> commands.get (422 if
+  unknown); precedence body > command > prefs for intent/scope; append
+  command.instructions to the system prompt; store {"command": name} on the user
+  message; run command.parse(answer) and merge into assistant metadata + spread
+  into the response (so client gets `exam`).
+- GET /commands (separate top-level commands_router, NOT under the project/chat
+  prefix since commands are global) -> describe(): names + descriptions + the
+  preprompts (PRD "transparent slash-command preprompts"). Mounted in main.py;
+  chat/__init__ now exports router + commands_router.
+
+Why: /mockexam = generate Q/A pairs, formatted so answers can be parsed out and
+hidden. Implemented as a formatting preprompt + parser (single LLM pass). NOTE:
+/deepsummary is intentionally NOT this — it's a multi-pass agentic pipeline
+(recurse topics -> per-subtopic gen -> recombine), a separate future feature.
+
+Verification (LIVE end-to-end, test.pdf):
+- GET /commands -> 200 ['mockexam'].
+- POST message {command:"mockexam", content:"Make a 3-question mock exam on RLHF"}
+  -> 201, exam parsed into 3 items: Q1 multiple-choice (hidden answer "(B)..."),
+  Q2/Q3 open, KaTeX intact ($U_\phi(y,x)$) in both question and answer. user-msg
+  metadata {command:mockexam}; assistant metadata keys = cited, command, exam,
+  retrieval_tokens, retrieved, strategy. Unknown command -> 422.
+
+================================================================================
+2026-06-01  retrieval: fidelity-first scope routing (skeleton default, medoid opt-in)
+================================================================================
+What:
+- route(): over-budget global queries now DEFAULT to _skeleton (planner selects
+  relevant branches, stuffs their full content_sparse to budget = real chunks).
+  _medoid (lossy "one chunk per cluster") only runs on an EXPLICIT scope=="all".
+- Removed _classify_scope() + _ALL_HINTS: scope is no longer keyword-auto-detected
+  (previously "overview/everything/summarize" in the query auto-dropped you to the
+  lossy medoid path). Auto/anything-but-"all" -> skeleton.
+- Updated module + route() docstrings accordingly.
+
+Why (user intent, correcting an inverted comment): the user wrote "prefer all,
+fall back to topic only on token issues" — but in the code "all"->medoid is the
+LOWEST-fidelity path and "topic"->skeleton returns far MORE real chunks. Their
+true goal is "keep full chunks, only degrade when tokens force it, avoid the
+medoid-only answer." So: skeleton is the over-budget default; medoid is opt-in.
+For a broad query the planner selects everything, so skeleton degrades gracefully
+to a budget-capped stuff.
+
+Verification (LIVE, route() direct on a project with 7635 sparse tokens):
+- budget 15000 (fits) -> stuff.
+- budget 10 (forced over-budget), query "...overview of everything..." , auto
+  scope -> skeleton (NOT medoid — the old keyword path would have picked medoid).
+- budget 10 + explicit scope="all" -> medoid (opt-in still works).
+
+Follow-up idea (deferred): an even-higher-fidelity over-budget path that
+vector-ranks ALL chunks by relevance and stuffs content_sparse to budget with no
+planner LLM call; keep skeleton as default for now.
+
+================================================================================
+2026-06-01  /deepsummary: multi-pass deep dive (in-process async task, no worker)
+================================================================================
+Decision: deepsummary is I/O-bound (a handful of LLM calls), NOT cpu-bound, so it
+does NOT use the ARQ worker. It runs as an in-process asyncio task spawned by the
+web app, and the result lands in a normal chat message (not an artifact).
+
+What:
+- app/chat/generate.py: extracted the single grounded-answer primitive
+  grounded_answer(project_id, query, prefs, *, system_prompt, history, intent,
+  scope, model?, max_tokens?) -> GroundedAnswer(answer, retrieval). Pure: route()
+  + complete(), no HTTP/DB. Also moved cited_chunks()/_CITE_RE here (shared).
+  Both send_message and deepsummary call this — the pipeline loops the PRIMITIVE,
+  never the HTTP endpoint.
+- app/chat/chat.py refactor: send_message now calls grounded_answer/cited_chunks
+  (dropped its local copies + the direct route()/complete() calls). Added _spawn()
+  + a _background_tasks set (strong refs so create_task() results aren't GC'd).
+  New branch: if command.background -> insert a placeholder assistant message
+  (content="", metadata.state="generating"), _spawn(command.runner(...)), return
+  immediately. Synchronous commands (mockexam) + normal chat unchanged in behavior.
+- app/chat/deepsummary.py: the pipeline. _outline() (cheap planner_model, JSON
+  array of 3-7 subtopics, capped _MAX_SECTIONS=7, falls back to [topic]) ->
+  _section() per subtopic via grounded_answer, concurrent with a Semaphore(4) ->
+  assemble "# topic / ## subtopic" document. _set_result() UPDATEs the placeholder
+  message: content=document, metadata={state:ready, command, topic, outline,
+  sections:[{title,cited}], cited:union}. On any error -> state:error + message.
+  Per-section [S#] number that section's OWN sources (noted in module docstring);
+  per-section cited lists stored in metadata.sections.
+- commands.py: Command gained background:bool + runner:Callable; deepsummary
+  registered (background=True, runner=deepsummary.run, intent=global, INSTRUCTIONS
+  surfaced via GET /commands). describe() now includes "background".
+- No import cycle: chat -> commands -> deepsummary -> generate -> (llm/retrieval/
+  preferences); nothing imports back into chat/commands.
+
+Why a chat message (not artifact): user prefers it stay a simple chat response;
+mockexam is already just a message (metadata.exam), so deepsummary mirrors that —
+a threaded assistant message filled asynchronously, polled via GET .../messages.
+Caveat: an in-process task is lost if the web process restarts mid-run (message
+stuck "generating"); acceptable for self-host, add a stale-sweep later.
+
+Verification (LIVE end-to-end, test.pdf):
+- POST {command:deepsummary, content:"RLHF for language models"} -> 201 instantly,
+  assistant state="generating", content "".
+- Polled GET .../messages -> flipped to "ready". Outline = 7 subtopics; 7 sections
+  generated concurrently; union cited = 7. Document assembled with #/## headings,
+  intact KaTeX ($p_{\text{PT}}(y|x)$, $U_\phi(y,x)$) and [S#] citations.
+
+================================================================================
+2026-06-01  chat: stale-"generating" sweep (cleans up dead background tasks)
+================================================================================
+What:
+- New app/chat/sweep.py. sweep_once() UPDATEs messages whose metadata->>'state' =
+  'generating' and created_at < NOW() - 600s, setting metadata = metadata ||
+  '{"state":"error","error":"generation interrupted (stale)"}'::jsonb (jsonb merge
+  so command/topic/etc. are preserved). run_sweeper() loops sweep_once every 120s,
+  swallowing transient errors so the loop never dies.
+- main.py lifespan starts run_sweeper as an asyncio task after the pools are up,
+  and cancels it (suppressing CancelledError) on shutdown. It also sweeps once
+  immediately on startup -> cleans up messages left "generating" by a prior crash.
+Why: in-process deepsummary tasks are lost if the web process restarts mid-run,
+leaving the placeholder message stuck "generating" forever (the caveat noted when
+deepsummary was added). This is the promised stale-sweep.
+Verification (LIVE): inserted a 20-min-old generating msg + a fresh one;
+sweep_once() -> swept 1; stale -> state "error" with command "deepsummary" still
+present (merge preserved it); fresh -> still "generating".
+
+Note (user inline idea, deepsummary._section): sections could benefit from
+"agentic but stuffy" retrieval (currently each section uses default auto -> mostly
+specific top-k). Not done; candidate improvement.

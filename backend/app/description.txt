@@ -1,0 +1,6 @@
+this app folder contains the main entrypoint to the backend. 
+
+We have the main.py which is the main backend endpoint of the application
+
+and worker.py this is were queued jobs will be run, such as UMAP projections, chunking etc
+-> this is needed so that the main backend endpoint doesn't get overloaded doing cpu heavy stuff
