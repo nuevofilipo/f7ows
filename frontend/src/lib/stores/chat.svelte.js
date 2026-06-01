@@ -51,6 +51,7 @@ export class ChatStore {
 	 * @param {string} [opts.command]
 	 * @param {string} [opts.parentPath]
 	 * @param {string} [opts.intent]
+	 * @param {number} [opts.level]  visual hierarchy level for the new turn (1–3)
 	 */
 	async send({ content, command, parentPath, intent, level = 1 }) {
 		this.sending = true;

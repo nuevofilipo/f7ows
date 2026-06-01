@@ -6,19 +6,19 @@
 	 * @type {{
 	 *   commands: { name: string, description: string }[],
 	 *   sending?: boolean,
-	 *   replyingTo?: import('$lib/api/chats.js').Message | null,
+	 *   actionTarget?: { message: import('$lib/api/chats.js').Message, mode: 'reply' | 'continue' } | null,
 	 *   lastTokens?: number | null,
 	 *   onSend: (p: { content: string, command?: string }) => void,
-	 *   onCancelReply?: () => void
+	 *   onCancelAction?: () => void
 	 * }}
 	 */
 	let {
 		commands,
 		sending = false,
-		replyingTo = null,
+		actionTarget = null,
 		lastTokens = null,
 		onSend,
-		onCancelReply
+		onCancelAction
 	} = $props();
 
 	let text = $state('');
@@ -72,10 +72,12 @@
 		</ul>
 	{/if}
 
-	{#if replyingTo}
+	{#if actionTarget}
 		<div class="flex items-center justify-between border-b border-paper px-3 py-1 text-xs text-paper/70">
-			<span>↳ replying in thread</span>
-			<button class="hover:text-accent" onclick={() => onCancelReply?.()}>cancel</button>
+			<span>
+				{actionTarget.mode === 'reply' ? '↳ replying — one level deeper' : '⤵ continuing thread'}
+			</span>
+			<button class="hover:text-accent" onclick={() => onCancelAction?.()}>cancel</button>
 		</div>
 	{/if}
 

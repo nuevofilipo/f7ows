@@ -32,6 +32,7 @@ export const listMessages = (projectId, chatId) =>
  * @param {string} [payload.parent_path]  branch under a specific message
  * @param {string} [payload.command]      e.g. "mockexam" | "deepsummary"
  * @param {string} [payload.intent]
+ * @param {number} [payload.level]         visual hierarchy level (1–3) for the new turn
  * @param {Record<string, unknown>} [payload.settings]  per-request preference overrides
  * @returns {Promise<{ user_message: Message, assistant_message: Message, cited?: any[], retrieved?: any[], [k:string]: any }>}
  */

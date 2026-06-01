@@ -11,14 +11,16 @@
 	 * assistant turns render full-width markdown/KaTeX with citations.
 	 * @type {{
 	 *   message: import('$lib/api/chats.js').Message,
-	 *   onReply?: (m: import('$lib/api/chats.js').Message) => void
+	 *   onReply?: (m: import('$lib/api/chats.js').Message) => void,
+	 *   onContinue?: (m: import('$lib/api/chats.js').Message) => void
 	 * }}
 	 */
-	let { message, onReply } = $props();
+	let { message, onReply, onContinue } = $props();
 
 	const isUser = $derived(message.role === 'user');
 	const pending = $derived(isPending(message));
 	const generating = $derived(isGenerating(message));
+	const level = $derived(message.metadata?.level ?? 1);
 	const exam = $derived(
 		Array.isArray(message.metadata?.exam) ? message.metadata.exam : null
 	);
@@ -47,13 +49,19 @@
 			</div>
 		{/if}
 		<Citations {cited} />
-		{#if onReply && !generating && !pending}
-			<button
-				class="mt-1 text-xs text-paper/50 opacity-0 transition-opacity hover:text-accent group-hover:opacity-100"
-				onclick={() => onReply?.(message)}
+		{#if !generating && !pending && (onContinue || onReply)}
+			<div
+				class="mt-1 flex gap-4 text-xs text-paper/50 opacity-0 transition-opacity group-hover:opacity-100"
 			>
-				↳ reply
-			</button>
+				{#if onContinue}
+					<button class="hover:text-accent" onclick={() => onContinue?.(message)}>
+						⤵ continue thread
+					</button>
+				{/if}
+				{#if onReply && level < 3}
+					<button class="hover:text-accent" onclick={() => onReply?.(message)}>↳ reply</button>
+				{/if}
+			</div>
 		{/if}
 	</div>
 {/if}
