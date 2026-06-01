@@ -25,8 +25,12 @@ class Command:
     name: str
     description: str
     instructions: str                          # appended to the system prompt
-    intent: str | None = None                  # retrieval intent override
-    scope: str | None = None                   # retrieval scope override
+    intent: str | None = None                  # retrieval intent override (None = auto)
+    # Keyword appended to the *routing* query so the command always trips the
+    # non-specific keyword pass and reaches the LLM intent classifier (-> inbetween
+    # or global, never a specific lookup). The answer is still grounded on the real
+    # query, so this never pollutes the generated text.
+    retrieval_keyword: str | None = None
     parse: Callable[[str], dict] | None = None  # answer text -> structured metadata
     # Background commands (e.g. deepsummary) are multi-pass: send_message inserts a
     # placeholder assistant message and spawns ``runner`` instead of replying inline.
@@ -68,7 +72,9 @@ COMMANDS: dict[str, Command] = {
         name="mockexam",
         description="Generate a mock exam (question/answer pairs) from the sources.",
         instructions=_MOCKEXAM_INSTRUCTIONS,
-        intent="global",   # an exam should cover the material broadly
+        # intent stays auto: a mock exam may be about one topic or the whole course;
+        # the keyword just guarantees we don't treat it as a precise lookup.
+        retrieval_keyword="mockexam",
         parse=_parse_mockexam,
     ),
     "deepsummary": Command(
@@ -76,7 +82,7 @@ COMMANDS: dict[str, Command] = {
         description="Generate a long, structured deep-dive on a topic. Multi-pass; "
                     "the reply fills in asynchronously (poll the message until ready).",
         instructions=deepsummary.INSTRUCTIONS,
-        intent="global",
+        retrieval_keyword="deepsummary",
         background=True,
         runner=deepsummary.run,
     ),
@@ -91,6 +97,6 @@ def describe() -> list[dict]:
     """Commands as a transparency-friendly list (name + description + preprompt)."""
     return [
         {"name": c.name, "description": c.description, "instructions": c.instructions,
-         "intent": c.intent, "scope": c.scope, "background": c.background}
+         "intent": c.intent, "retrieval_keyword": c.retrieval_keyword, "background": c.background}
         for c in COMMANDS.values()
     ]

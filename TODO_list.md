@@ -25,21 +25,21 @@
 
 **Phase 5: Chat & LangGraph**
 
-- [ ] ltree branch query (fetch ancestors for context window)
+- [x] ltree branch query (fetch ancestors for context window)
 - [ ] LangGraph router: pgvector search vs global summary (not using langgraph after all, it would have been overkill)
 - [ ] Streaming SSE response
 - [ ] On chunk citation → mark chunk status as `studied`
 
 **Phase 6: SvelteKit Frontend**
 
-- [ ] Init SvelteKit + Tailwind, set up auth state
-- [ ] 3-pane layout (Sources / Chat / Artifacts)
-- [ ] Nested chat UI with Reply branching
-- [ ] KaTeX rendering via rehype-katex + remark-math
+- [x] Init SvelteKit + Tailwind, set up auth state
+- [x] 3-pane layout (Sources / Chat / Artifacts)
+- [ ] Nested chat UI with Reply branching -> working on
+- [x] KaTeX rendering via rehype-katex + remark-math
 
 **Phase 7: Slash Commands + Voice**
 
-- [ ] `/deepsummary` map-reduce LangGraph graph
+- [x] `/deepsummary` map-reduce LangGraph graph -> backend works frontend not existant yet
 - [ ] `/mockexam` state machine + collapsible answer UI
 - [ ] MediaRecorder in SvelteKit → Deepgram endpoint with custom vocab → LangGraph grader
 

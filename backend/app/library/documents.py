@@ -7,6 +7,7 @@ can verify what landed.
 """
 from __future__ import annotations
 
+import json
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
@@ -22,13 +23,21 @@ _MAX_BYTES = 50 * 1024 * 1024  # 50 MB upload cap, WHY is this necessary, could 
 
 
 def _document_dict(row) -> dict:
+    # asyncpg returns jsonb as a JSON string (no codec registered), so parse the
+    # status blob back into a dict for clients (UI polls status.state).
+    status = row["status"]
+    if isinstance(status, str):
+        try:
+            status = json.loads(status)
+        except (ValueError, TypeError):
+            status = {}
     return {
         "id": row["id"],
         "name": row["name"],
         "storage_key": row["storage_key"],
         "content_type": row["content_type"],
         "size_bytes": row["size_bytes"],
-        "status": row["status"],
+        "status": status if isinstance(status, dict) else {},
         "created_at": row["created_at"],
     }
 

@@ -30,3 +30,7 @@ frontend/.vercel/
 Thumbs.db
 
 backend/alembic/
+
+# Transparent execution traces + testsuite PDF drop-folder
+backend/runs/
+backend/testsuite/pdfs_to_upload/*.pdf

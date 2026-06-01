@@ -20,8 +20,34 @@ from app.db import acquire, create_pool, close_pool
 from app.embed.embed import embed
 from app.ingest.parse import parse
 from app.library import storage
+from app import trace
 
 logger = logging.getLogger(__name__)
+
+
+def _render_chunks(chunks) -> str:
+    """Per-chunk table + full-vs-sparse content, so chunking quality is eyeballable."""
+    lines = [f"# Chunks ({len(chunks)})\n",
+             "| idx | tokens | path | heading trail |",
+             "|----:|-------:|------|---------------|"]
+    for c in chunks:
+        trail = " › ".join(c.heading_trail) if c.heading_trail else ""
+        lines.append(f"| {c.chunk_index} | {c.token_count} | `{c.path}` | {trail} |")
+    lines.append("\n---")
+    for c in chunks:
+        lines.append(f"\n## [{c.chunk_index}] `{c.path}`  ({c.token_count} tok)\n")
+        lines.append("**full:**\n\n```\n" + c.content_full + "\n```\n")
+        lines.append("**sparse:**\n\n```\n" + c.content_sparse + "\n```")
+    return "\n".join(lines)
+
+
+def _render_embeddings(chunks, embeddings) -> str:
+    dim = len(embeddings[0]) if embeddings else 0
+    lines = ["# Embeddings\n", f"- vectors: {len(embeddings)}", f"- dim: {dim}\n"]
+    for c, e in zip(chunks, embeddings):
+        head = ", ".join(f"{float(x):+.3f}" for x in list(e)[:6])
+        lines.append(f"- [{c.chunk_index}] `{c.path}` → [{head}, …]")
+    return "\n".join(lines)
 
 
 async def _set_status(document_id: UUID, state: str, **extra) -> None:
@@ -57,48 +83,58 @@ async def ingest_document(ctx: dict, document_id: str) -> dict:
         if doc is None:
             raise ValueError(f"document {doc_id} not found")
 
-        await _set_status(doc_id, "parsing")
-        pdf_bytes = await storage.download_bytes(doc["storage_key"])
-        markdown = await asyncio.to_thread(parse, pdf_bytes, name=doc["name"])
+        with trace.begin_run("ingest", label=doc["name"],
+                             document_id=str(doc_id), project_id=str(doc["project_id"])) as tr:
+            await _set_status(doc_id, "parsing")
+            pdf_bytes = await storage.download_bytes(doc["storage_key"])
+            with tr.timer("parse"):
+                markdown = await asyncio.to_thread(parse, pdf_bytes, name=doc["name"])
+            tr.write("00_parsed.md", markdown)
 
-        doc_slug = doc["name"].rsplit(".", 1)[0] or str(doc_id)
-        chunks = await asyncio.to_thread(chunk_markdown, markdown, doc_slug=doc_slug)
-        if not chunks:
-            await _set_status(doc_id, "ready", chunks=0)
-            return {"status": "ok", "document_id": str(doc_id), "chunks": 0}
+            doc_slug = doc["name"].rsplit(".", 1)[0] or str(doc_id)
+            with tr.timer("chunk"):
+                chunks = await asyncio.to_thread(chunk_markdown, markdown, doc_slug=doc_slug)
+            if not chunks:
+                tr.set(chunks=0)
+                await _set_status(doc_id, "ready", chunks=0)
+                return {"status": "ok", "document_id": str(doc_id), "chunks": 0}
+            tr.write("01_chunked.md", _render_chunks(chunks))
+            tr.set(chunks=len(chunks))
 
-        await _set_status(doc_id, "embedding", chunks=len(chunks))
-        embeddings = await embed([c.content_full for c in chunks])
+            await _set_status(doc_id, "embedding", chunks=len(chunks))
+            with tr.timer("embed"):
+                embeddings = await embed([c.content_full for c in chunks])
+            tr.write("02_embedded.md", _render_embeddings(chunks, embeddings))
 
-        rows = [
-            (
-                doc_id, c.chunk_index, c.content_full, c.content_sparse, emb, c.path,
-                json.dumps({"heading_trail": c.heading_trail, "token_count": c.token_count}),
-            )
-            for c, emb in zip(chunks, embeddings)
-        ]
-        async with acquire() as conn:
-            async with conn.transaction():
-                # Idempotent re-ingest: clear any prior chunks for this document.
-                await conn.execute("DELETE FROM chunks WHERE document_id = $1", doc_id)
-                await conn.executemany(
-                    """
-                    INSERT INTO chunks
-                        (document_id, chunk_index, content_full, content_sparse,
-                         embedding, path, metadata)
-                    VALUES ($1, $2, $3, $4, $5, $6::ltree, $7::jsonb)
-                    """,
-                    rows,
+            rows = [
+                (
+                    doc_id, c.chunk_index, c.content_full, c.content_sparse, emb, c.path,
+                    json.dumps({"heading_trail": c.heading_trail, "token_count": c.token_count}),
                 )
+                for c, emb in zip(chunks, embeddings)
+            ]
+            async with acquire() as conn:
+                async with conn.transaction():
+                    # Idempotent re-ingest: clear any prior chunks for this document.
+                    await conn.execute("DELETE FROM chunks WHERE document_id = $1", doc_id)
+                    await conn.executemany(
+                        """
+                        INSERT INTO chunks
+                            (document_id, chunk_index, content_full, content_sparse,
+                             embedding, path, metadata)
+                        VALUES ($1, $2, $3, $4, $5, $6::ltree, $7::jsonb)
+                        """,
+                        rows,
+                    )
 
-        await _set_status(doc_id, "ready", chunks=len(chunks))
-        # NOTE: projections/clusters are intentionally NOT enqueued here. A new
-        # document shifts the whole project map, so recomputing per-document would
-        # redo that work N times for an N-file batch. Instead the upload endpoint
-        # enqueues a single finalize_project job that waits for all the batch's
-        # documents and recomputes once.
-        logger.info("ingest_document: %s ready (%d chunks)", doc_id, len(chunks))
-        return {"status": "ok", "document_id": str(doc_id), "chunks": len(chunks)}
+            await _set_status(doc_id, "ready", chunks=len(chunks))
+            # NOTE: projections/clusters are intentionally NOT enqueued here. A new
+            # document shifts the whole project map, so recomputing per-document would
+            # redo that work N times for an N-file batch. Instead the upload endpoint
+            # enqueues a single finalize_project job that waits for all the batch's
+            # documents and recomputes once.
+            logger.info("ingest_document: %s ready (%d chunks)", doc_id, len(chunks))
+            return {"status": "ok", "document_id": str(doc_id), "chunks": len(chunks)}
 
     except Exception as exc:  # noqa: BLE001 - record on the doc, then re-raise for ARQ
         logger.exception("ingest_document failed: %s", doc_id)
@@ -181,6 +217,11 @@ async def recalculate_projections(ctx: dict, project_id: str) -> dict:
             updates,
         )
 
+    methods = {m: (coords[m].shape if coords[m] is not None else None)
+               for m in ("umap_2d", "umap_3d", "pca", "tsne")}
+    trace.project_artifact(pid, "projections.md",
+                           f"# Projections\n\n- chunks: {len(ids)}\n" +
+                           "\n".join(f"- **{m}**: {shape}" for m, shape in methods.items()))
     logger.info("recalculate_projections: %s wrote coords for %d chunks", pid, len(ids))
     return {"status": "ok", "project_id": str(pid), "chunks": len(ids)}
 
@@ -230,6 +271,11 @@ async def recalculate_clusters(ctx: dict, project_id: str) -> dict:
                 [(pid, r.label, r.centroid, ids[r.medoid_index], r.member_count) for r in results],
             )
 
+    md = [f"# Clusters ({len(results)})\n",
+          "| members | label | medoid chunk |", "|--------:|-------|--------------|"]
+    for r in sorted(results, key=lambda r: r.member_count, reverse=True):
+        md.append(f"| {r.member_count} | {r.label!r} | `{ids[r.medoid_index]}` |")
+    trace.project_artifact(pid, "clusters.md", "\n".join(md))
     logger.info("recalculate_clusters: %s wrote %d clusters", pid, len(results))
     return {"status": "ok", "project_id": str(pid), "clusters": len(results)}
 

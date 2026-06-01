@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from app import trace
 from app.llm import complete
 from app.preferences import Preferences
 from app.retrieval import RetrievalResult, route
@@ -47,7 +48,7 @@ async def grounded_answer(
     system_prompt: str,
     history=(),
     intent: str = "auto",
-    scope: str = "auto",
+    routing_query: str | None = None,
     model: str | None = None,
     max_tokens: int | None = None,
 ) -> GroundedAnswer:
@@ -56,12 +57,18 @@ async def grounded_answer(
     Messages are ordered system -> history -> (sources + question) so the static
     instructions and prior turns form a cache-friendly prefix. ``model`` /
     ``max_tokens`` override the prefs (e.g. a cheap planner model for an outline).
+    ``routing_query`` (if given) is what's sent to the retrieval router for
+    intent classification + planning, while the answer is still grounded on the
+    real ``query`` — slash commands use this to inject their keyword so they reach
+    the LLM classifier instead of being mis-read as a specific lookup.
     """
-    retrieval = await route(project_id, query, intent=intent, scope=scope,
-                            k=prefs.retrieval_k, budget=prefs.retrieval_budget)
+    retrieval = await route(project_id, routing_query or query, intent=intent,
+                            k=prefs.retrieval_k, budget=prefs.retrieval_budget,
+                            planner_max_tokens=prefs.planner_max_tokens)
     messages = [{"role": "system", "content": system_prompt}]
     messages += [{"role": h["role"], "content": h["content"]} for h in history]
     messages.append({"role": "user", "content": f"# Sources\n{retrieval.context}\n\n# Question\n{query}"})
+    trace.current_run().write("prompt.md", trace.render_messages(messages), unique=True)
     answer = await complete(
         messages, model=model or prefs.chat_model, max_tokens=max_tokens or prefs.max_tokens,
         temperature=prefs.temperature, top_p=prefs.top_p, top_k=prefs.top_k,

@@ -1,0 +1,268 @@
+2026-06-01 — Transparent tracing + HTTP testsuite
+=================================================
+
+WHAT
+- Added app/trace.py: a contextvar-scoped Tracer embedded in the real backend.
+  begin_run() opens runs/runN_<kind>_<label>/ (exclusive mkdir => safe across the
+  web + worker processes); current_run() returns the active tracer or a no-op when
+  TRACE!=1 / no run is open, so tap sites are harmless one-liners and signatures
+  never change. Helpers: write(unique=), append, json, note, timer, set,
+  project_artifact(), render_prefs(), render_messages().
+- Surgically tapped the real code paths (no logic changes):
+    worker.ingest_document      -> 00_parsed.md, 01_chunked.md (full vs sparse),
+                                   02_embedded.md, per-stage timings in meta.json
+    worker.recalculate_clusters/projections -> runs/project_<id8>/{clusters,projections}.md
+    chat.send_message           -> chat run: preferences.md + answer.md
+    retrieval.route             -> retrieval.md (strategy + why + assembled context);
+                                   refactored to a single return so all branches log
+    generate.grounded_answer    -> prompt.md (exact messages sent to the LLM)
+    chat/deepsummary.run        -> own run: pass1_outline.md, pass2_*.md, final.md
+- Added backend/testsuite/ — a thin HTTP driver (NOT importing backend internals)
+  that calls the real endpoints exactly like the frontend will, so traces reflect
+  real browser behaviour:
+    config.py   namespaced test user/project + paths
+    procs.py    spawns & tears down uvicorn + arq (TRACE=1), waits on /healthz
+    client.py   httpx cookie client: register/login, project, upload batch,
+                poll docs til ready, send messages, poll async (deepsummary) msgs
+    chat_repl.py terminal REPL: live /intent /scope /budget /k, /reply branching,
+                /mockexam, /deepsummary; prints strategy+citations+trace dir per turn
+    __main__.py  CLI: ingest | chat | clean (--runs); ingest/chat auto-start procs
+    pdfs_to_upload/  drop-folder; README.md
+- .gitignore: ignore backend/runs/ and the dropped PDFs.
+
+WHY
+- Goal is transparency/traceability of the backend that survives the move to a
+  real frontend. Putting the tracer INSIDE the code path (not a parallel harness)
+  means identical traces whether a call is simulated from the terminal or made by
+  the browser. Driving the real HTTP endpoints (Redis/ARQ already wired) tests the
+  actual upload->worker->finalize and chat paths, not a re-implementation.
+
+VERIFIED
+- All files parse; tracer smoke test (run naming, unique-suffix, project artifact,
+  TRACE=0 no-op) passes; full `import app.main, app.worker, testsuite.*` via venv OK.
+- NOT yet run end-to-end against live Postgres/Redis/bucket (needs the services up).
+
+2026-06-01 — Testsuite fixes (made `python -m testsuite ingest` work end-to-end)
+================================================================================
+BUGS FOUND & FIXED
+1. AttributeError 'str' has no attribute 'get' in wait_until_ready:
+   documents.py returned the JSONB `status` column as the raw asyncpg JSON STRING.
+   Fixed _document_dict() to json.loads it into a dict (same gotcha auth.py notes
+   for settings). Benefits the frontend too (it polls status.state).
+2. Missing project artifacts (no project_<id>/clusters.md|projections.md):
+   `ingest` returned as soon as docs were `ready`, tearing down the worker BEFORE
+   finalize_project ran the project-wide projections+clusters. Added
+   _wait_for_finalize() in cmd_ingest — polls the DB (no HTTP surface for this yet)
+   until umap_2d is written for all chunks, with a 180s timeout+warning.
+3. Intermittent ingest hang / "document not found" noise:
+   clean wiped the DB project but left orphaned ARQ jobs in Redis; the next worker
+   drained them against deleted docs (errors) and the pileup (49 keys seen) starved
+   fresh jobs -> the ~600s parse stall. clean now also flushes arq:* redis keys.
+
+VERIFIED (live Postgres/Redis/bucket)
+- Pristine run: clean --runs (DELETE project, flushed 49 ARQ keys, removed runs/)
+  then ingest of 3 PDFs -> all ready (8/12/79 chunks), finalize fired ONCE,
+  projections 99/99 chunks, clusters=21 with sensible labels (rlhf / legal
+  contracts / tokenization / embeddings). Zero "not found" errors.
+- runs/ now holds exactly: run1..3_ingest_* (00_parsed/01_chunked/02_embedded/
+  meta.json w/ parse|chunk|embed timings) + project_<id>/{clusters,projections}.md
+- Big 19MB PDF parse is the variable cost (~0.2s..40s); finalize's cooperative
+  5s re-enqueue waits it out correctly.
+NOT yet exercised live: the chat REPL (/mockexam, /deepsummary) — next.
+Test project left INGESTED so `python -m testsuite chat` can be tried immediately.
+
+2026-06-01 — Three-level retrieval intent (specific / inbetween / global), medoid removed
+==========================================================================================
+WHAT
+- Retrieval is now intent-driven, not corpus-size-first:
+    specific  -> pgvector top-k over content_full
+    inbetween -> skeleton (LLM picks ltree branches) for ANY corpus size
+    global    -> corpus<=budget ? stuff-all : skeleton
+  Reason: "summarise topic X" needs all of ONE topic, not the whole project, so it
+  must focus (skeleton) even on a small corpus instead of blindly stuffing.
+- intent="auto": free keyword pass (specific vs not) -> only on a hit, one cheap LLM
+  call (_llm_classify_scope) splits inbetween vs global (fallback: inbetween).
+- Removed the medoid strategy entirely (lossy). Skeleton planner failure now falls
+  back to a budget-capped _stuff. Clusters are still computed (map UI), just not
+  used for retrieval.
+- Removed `scope` plumbing everywhere (router/grounded_answer/send_message/prefs/
+  REPL); dropped preferences.default_scope; default_intent choices now
+  (auto, specific, inbetween, global).
+- Slash commands no longer force intent=global. Instead each carries a
+  retrieval_keyword ("mockexam"/"deepsummary") that is appended to the *routing*
+  query (new grounded_answer routing_query arg) so they always trip the keyword
+  pass and reach the classifier — answer still grounded on the real query, so no
+  text pollution. deepsummary outline + sections inject the keyword too.
+- planner_max_tokens (added earlier) also powers the new classifier call.
+- retrieval.md trace drops scope, shows the classified intent + chosen strategy.
+
+WHY
+- The old flow stuffed the whole corpus for any global-ish query on a small project,
+  wasting context and ignoring topic focus. Three levels give a clean mental model
+  and reuse the existing skeleton machinery for the middle case.
+
+VERIFIED (live, 3-PDF test project)
+- specific Q                    -> strategy=specific
+- "summarise everything about word embeddings" -> skeleton (classifier: inbetween)
+- "overview of the entire course material"      -> skeleton (global, corpus>budget)
+- mockexam "word embeddings"    -> skeleton (reached classifier, not specific)
+- imports/wiring checked; _medoid gone; GET /commands describe() no longer refs scope.
+NOTE: saw a transient port-8000 bind error when a prior uvicorn hadn't released the
+socket; procs retry/health-wait rode through it. Watch if it recurs.
+
+2026-06-01 — Frontend scaffolded (SvelteKit + Tailwind)
+========================================================
+WHAT
+- Initialised the SvelteKit app under frontend/ via `sv create` (minimal template,
+  JS + JSDoc types — no TypeScript, per preference). Svelte 5 (runes mode forced in
+  svelte.config.js), SvelteKit 2, Vite 8, adapter-auto.
+- Added Tailwind CSS v4 with the @tailwindcss/typography plugin (for rendering chat
+  markdown / KaTeX-heavy answers) via `sv add tailwindcss` (--no-git-check because
+  the repo tree was dirty from backend work).
+WHY
+- PRD techstack is SvelteKit + Tailwind + KaTeX. This is the groundwork before
+  building the notebook page UI against the existing backend HTTP API
+  (auth cookie, /projects, /documents, /chats, /commands, /settings).
+NOTE
+- Figma MCP server is NOT installed, so the referenced design (node 26-3) could not
+  be read; awaiting either the Figma Dev Mode MCP connection or exported PNGs.
+
+2026-06-01 — Frontend: auth + notebook chat core implemented
+=============================================================
+CONTEXT
+- Figma MCP later connected; read the two designs:
+  notebook page (node 26:3) and auth page (node 88:67). Design language:
+  bg #0f0f0f, fg/borders #f5f4f5, accent #ed4bc7, Arial, sharp rectangles.
+  Brand mark "flows" rendered as f + 180°-rotated 7 + ows.
+- Decisions from the user: direct cross-origin to backend (NOT a Vite proxy),
+  deploying on Railway; first scope = auth + chat core; project structure approved.
+
+WHAT
+- Theme: src/routes/layout.css — Tailwind v4 @theme tokens (ink/paper/accent),
+  Arial, KaTeX css import, .prose-chat dark-mode styles for rendered answers.
+- Config + API layer (JS/JSDoc, src/lib/):
+    config.js          API_BASE (VITE_API_BASE_URL, default http://localhost:8000)
+    api/client.js      fetch wrapper, credentials:'include', ApiError(status,detail)
+    api/{auth,projects,documents,chats,settings}.js  one module per backend router
+- State (Svelte 5 runes, .svelte.js):
+    stores/session.svelte.js  current user via /auth/me; login/register/logout
+    stores/chat.svelte.js     ChatStore: load/send + poll background (deepsummary)
+                              msgs til metadata.state==ready; buildTree() for ltree nesting
+- Components:
+    ui/        Button, Spinner, Modal
+    chat/      Citations, MockExam (collapsible Q/A), MessageBubble (user box vs
+               assistant prose+KaTeX), MessageThread (recursive nested replies),
+               Composer (textarea, slash-command menu, no-context toggle, token readout)
+    notebook/  SourcesPanel (upload PDFs + poll ingest status), OutputsPanel
+               (secondary chat / outputs tabs — STUBBED), ChatPanel (Main Chat,
+               owns ChatStore, reply-to-branch), ChatSettings (schema-driven prefs
+               modal incl. editable system prompt), NotebookShell (top bar + 3 panes,
+               collapsible sources/outputs, profile menu w/ logout, chat switcher)
+    utils/markdown.js  marked + marked-katex-extension + DOMPurify
+- Routes:
+    +layout.js (ssr=false — SPA, since auth cookie is browser-only/cross-origin)
+    +layout.svelte  boots session, central auth guard (-> /login or /)
+    login/+page.svelte   combined login/signup, brand mark
+    +page.svelte         notebooks list + create (gateway to notebook)
+    projects/[projectId]/+page.svelte  loads project name (from list — no GET-one
+                                       endpoint) + chats, opens latest or fresh
+                                       client-UUID chat, renders NotebookShell
+- Deps added: marked, marked-katex-extension, katex, dompurify.
+
+WHY
+- Mirrors the approved modular structure (thin API modules, rune stores, small
+  components). SPA + cross-origin cookie matches the chosen wiring and Railway plan
+  (set VITE_API_BASE_URL at build; serve same-site to keep the cookie if desired).
+
+VERIFIED
+- `npm run build` clean; `npm run check` 0 errors (4 benign warnings: store rebuilt
+  in $effect, modal backdrop click pattern, scaffold 'node' types note).
+- Dev server boots; GET / and /login both 200.
+- NOT yet exercised against the live backend (needs uvicorn+postgres+redis up and
+  :5173 in the backend cors_origins) — end-to-end click-through is the next step.
+
+KNOWN LIMITATIONS / TODO
+- adapter-auto can't detect the prod target; pick @sveltejs/adapter-node for Railway.
+- Backend cors_origins must include the frontend origin (http://localhost:5173 dev).
+- Projection page, real Outputs (quiz/anki/download), secondary chat: later passes.
+
+2026-06-01 — Notebook UI polish: borders, focus, header, composer merge (Figma pass)
+====================================================================================
+WHAT (per Figma node 26:3 cleanup feedback)
+- Focus styling: removed focus:border-accent from every input/textarea (login,
+  notebook-list create box, settings fields, composer). Inputs no longer turn pink
+  on focus — border stays #F5F4F5 and the native blinking caret is the only cue.
+  Kept focus:outline-none so no browser focus ring appears.
+- Border normalization: replaced ALL border-paper/<opacity> with solid border-paper
+  (1px #F5F4F5) app-wide — notebook panels/headers, composer menu + reply bar,
+  Modal, Citations, MockExam, MessageThread nesting rule, MessageBubble, ChatSettings
+  inputs, notebook-list row + create input, login inputs, profile dropdown. Only the
+  Spinner's faint 2px ring track keeps an opacity (it's an animation, not a layout border).
+- Shared single-line seams between the 3 panes (NotebookShell): removed gap-4 so panes
+  sit flush; each shared edge is now ONE 1px line, not two borders + gutter.
+    Sources  = full border (its right edge is the Sources|Chat seam)
+    Chat     = border-y + border-r, NO border-l (uses Sources' right border); gets
+               border-l back via class:border-l={borderLeft} only when Sources is collapsed
+    Outputs  = border-y + border-r, NO border-l (uses Chat's right border)
+- Composer merged into the chat box: dropped its px-5 pb-5 wrapper and changed its
+  root from `border` to `border-t border-paper`. Its left/right/bottom now coincide
+  with the chat section's own border, so it reads as a divider of the chat window,
+  not a separate floating input box.
+- Chat header rework (ChatPanel):
+    * removed the header's border-b (no line under it).
+    * removed the "Main Chat" label; left side now holds the chat-selector dropdown +
+      "+ new chat" (moved down from the top app bar).
+    * right side: collapse toggles (hide/show sources, hide/show outputs) + Chat Settings.
+      The toggles moved here from the old separate row above the chat so the chat panel's
+      top border lines up with Sources/Outputs into one continuous top line.
+- NotebookShell top bar now keeps only project name (left) + Projection/My Profile
+  (right); the chat dropdown/new-chat were relocated into the chat header. New props
+  threaded to ChatPanel: chats, onSelectChat, onNewChat, sourcesOpen, outputsOpen,
+  borderLeft, onToggleSources, onToggleOutputs.
+
+WHY
+- Direct visual feedback against the Figma: equal-weight #F5F4F5 borders, single
+  seams between panes, an input that looks like part of the chat window, and a
+  cleaner header that doubles as the chat switcher. The toggle relocation is what
+  lets all three pane tops form one unbroken line.
+
+VERIFIED
+- `npm run check` 0 errors (same 4 pre-existing benign warnings).
+- Grep confirms no remaining border-paper/<n> (except the Spinner ring) and no
+  focus:border-accent anywhere.
+NOTE
+- Collapse toggles were not mentioned in the feedback but had to move somewhere to
+  keep the top borders aligned; parked them on the right of the chat header next to
+  Chat Settings. Easy to relocate if the user prefers them elsewhere.
+
+2026-06-01 — Notebook UI: draggable seams, header/tab cleanup
+=============================================================
+WHAT
+- Removed the hide/show sources/outputs toggle buttons from the chat header (and all
+  their plumbing: sourcesOpen/outputsOpen/borderLeft/onToggle* props gone from
+  ChatPanel + NotebookShell). Side panels are now always visible.
+- Made the two seams between the 3 panes DRAGGABLE to resize the side panels:
+    NotebookShell holds sourcesWidth/outputsWidth ($state, px) applied as inline
+    width on the Sources/Outputs wrappers; the chat stays flex-1. Each seam is a thin
+    handle (w-1, -mx-0.5 so it adds 0 layout width and sits centered on the shared
+    1px border; hover:bg-accent as the affordance). startDrag() uses pointer capture
+    so the drag survives the cursor leaving the handle. Widths clamp to MIN=220 /
+    MAX=560 so the chat always keeps room and the side panels stay reasonable.
+- ChatPanel section reverted to plain `border-y border-r border-paper` (no more
+  conditional border-l, since Sources is always present to supply the left seam).
+- SourcesPanel: removed the border-b under the "Sources" / "Add sources" header row.
+- OutputsPanel: centered the "secondary chat" / "outputs" tab labels (justify-center)
+  and made both labels the regular light colour (text-paper) instead of dimmed
+  text-paper/60 — active tab still gets an underline.
+- ChatPanel: removed the empty-state "No messages yet — ask something…" placeholder;
+  an empty chat now just shows nothing until the first message.
+
+WHY
+- Direct Figma-pass feedback: cleaner Sources header, centered/legible Outputs tabs,
+  user-controlled panel sizing instead of binary collapse, and no filler placeholder.
+
+VERIFIED
+- `npm run check` 0 errors (same 4 pre-existing benign warnings).
+NOTE
+- Drag widths are session-only (not persisted). If they should survive reloads,
+  stash them in localStorage — easy follow-up.

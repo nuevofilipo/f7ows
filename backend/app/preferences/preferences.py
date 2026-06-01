@@ -51,8 +51,8 @@ class Preferences:
     system_prompt: str
     retrieval_budget: int
     retrieval_k: int
+    planner_max_tokens: int
     default_intent: str
-    default_scope: str
 
 
 # Schema: one entry per Preferences field. ``default`` may be a literal or a
@@ -68,7 +68,7 @@ SCHEMA: dict[str, dict] = {
         "str", lambda: settings.chat_model,
         description="OpenRouter model id used to write chat answers (BYOK)."),
     "temperature": _spec(
-        "float", 0.3, min=0.0, max=2.0,
+        "float", 1.0, min=0.0, max=2.0,
         description="Sampling temperature; higher = more creative."),
     "top_p": _spec(
         "float", 1.0, min=0.0, max=1.0,
@@ -77,23 +77,27 @@ SCHEMA: dict[str, dict] = {
         "int", 0, min=0, max=500,
         description="Top-k sampling; 0 disables it."),
     "max_tokens": _spec(
-        "int", 2000, min=1, max=8000,
+        "int", 6000, min=1, max=10000,
         description="Maximum tokens in a chat answer."),
     "system_prompt": _spec(
         "str", DEFAULT_SYSTEM_PROMPT,
         description="System instructions prepended to every chat."),
     "retrieval_budget": _spec(
-        "int", 15000, min=500, max=200000,
+        "int", 15000, min=500, max=100000,
         description="Sparse-token budget for global-query retrieval."),
     "retrieval_k": _spec(
         "int", 8, min=1, max=50,
         description="Top-k chunks for specific (vector) retrieval."),
+    "planner_max_tokens": _spec(
+        "int", 2000, min=200, max=8000,
+        description="Max tokens for the cheap planner LLM (skeleton branch selection "
+                    "+ deepsummary outline). Reasoning models need headroom or they "
+                    "spend the whole budget on reasoning and return empty."),
     "default_intent": _spec(
-        "str", "auto", choices=("auto", "specific", "global"),
-        description="Default retrieval intent when not set per message."),
-    "default_scope": _spec(
-        "str", "auto", choices=("auto", "topic", "all"),
-        description="Default global-query scope when not set per message."),
+        "str", "auto", choices=("auto", "specific", "inbetween", "global"),
+        description="Default retrieval intent when not set per message. 'auto' "
+                    "classifies (keyword + LLM); 'inbetween' = focus on one topic "
+                    "via skeleton; 'global' = whole project."),
 }
 
 

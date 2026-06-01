@@ -25,6 +25,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
+from app import trace
 from app.auth import get_current_user
 from app.chat import commands
 from app.chat.generate import cited_chunks, grounded_answer
@@ -126,20 +127,32 @@ async def send_message(
     if not content:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Message content is required")
 
-    # Optional command (e.g. "mockexam") — injects a formatting preprompt and may
-    # override retrieval intent/scope and post-parse the answer.
+    # Optional command (e.g. "mockexam") — injects a formatting preprompt, may
+    # override retrieval intent, and post-parses the answer.
     command_name = body.get("command")
     command = commands.get(command_name)
     if command_name and command is None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Unknown command: {command_name}")
 
     # Effective settings: stored user prefs, with optional per-request overrides
-    # from a "settings" patch in the body. intent/scope may also be set directly;
+    # from a "settings" patch in the body. intent may also be set directly;
     # precedence is body override > command override > user default.
     overrides = body.get("settings") if isinstance(body.get("settings"), dict) else None
     prefs = resolve(current_user["settings"], overrides)
     intent = body.get("intent") or (command.intent if command else None) or prefs.default_intent
-    scope = body.get("scope") or (command.scope if command else None) or prefs.default_scope
+    # Commands inject a keyword into the routing query so they reach the intent
+    # classifier (the answer is still grounded on the real content).
+    routing_query = (f"{content} {command.retrieval_keyword}"
+                     if command and command.retrieval_keyword else None)
+
+    # Visual hierarchy level (1=main thread, deeper on reply, capped at 3). The
+    # frontend computes it from the two send buttons; we persist it on both the
+    # user and assistant turn so the tree survives a reload.
+    try:
+        level = int(body.get("level", 1))
+    except (TypeError, ValueError):
+        level = 1
+    level = max(1, min(3, level))
 
     # Insert the user turn and read back its branch (the conversation history).
     async with acquire() as conn:
@@ -162,7 +175,7 @@ async def send_message(
         user_path = await _next_child_path(conn, chat_id, parent_path and str(parent_path))
         user_msg = await _insert_message(
             conn, project_id, chat_id, user_path, "user", content,
-            {"command": command.name} if command else {},
+            {**({"command": command.name} if command else {}), "level": level},
         )
 
     # Background command (e.g. deepsummary): insert a placeholder assistant message,
@@ -173,37 +186,47 @@ async def send_message(
             assistant_path = await _next_child_path(conn, chat_id, user_path)
             assistant_msg = await _insert_message(
                 conn, project_id, chat_id, assistant_path, "assistant", "",
-                {"state": "generating", "command": command.name},
+                {"state": "generating", "command": command.name, "level": level},
             )
         _spawn(command.runner(project_id, content, prefs, assistant_msg["id"]))
         return {"user_message": user_msg, "assistant_message": assistant_msg}
 
     # Synchronous path: retrieve + generate one grounded answer.
     system_prompt = prefs.system_prompt + (f"\n\n{command.instructions}" if command else "")
-    try:
-        result = await grounded_answer(project_id, content, prefs, system_prompt=system_prompt,
-                                       history=history, intent=intent, scope=scope)
-    except LLMError as exc:
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"Chat model failed: {exc}")
-    answer, retrieval = result.answer, result.retrieval
+    with trace.begin_run("chat", label=command.name if command else "msg",
+                         project_id=str(project_id), chat_id=str(chat_id)) as tr:
+        tr.write("preferences.md", trace.render_prefs(prefs, intent=intent,
+                                                      command=command.name if command else None))
+        try:
+            result = await grounded_answer(project_id, content, prefs, system_prompt=system_prompt,
+                                           history=history, intent=intent, routing_query=routing_query)
+        except LLMError as exc:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"Chat model failed: {exc}")
+        answer, retrieval = result.answer, result.retrieval
 
-    # retrieved = everything we put in front of the model; cited = the subset it
-    # actually referenced via [S#] markers (parsed from the answer).
-    retrieved = [{"id": c["id"], "path": c["path"]} for c in retrieval.chunks]
-    cited = cited_chunks(answer, retrieval.chunks)
-    # Command-specific structured output (e.g. the parsed mock-exam questions).
-    extra = command.parse(answer) if command and command.parse else {}
-    metadata = {"strategy": retrieval.strategy, "retrieval_tokens": retrieval.token_count,
-                "retrieved": retrieved, "cited": cited, **extra}
-    if command:
-        metadata["command"] = command.name
-    async with acquire() as conn:
-        assistant_path = await _next_child_path(conn, chat_id, user_path)
-        assistant_msg = await _insert_message(
-            conn, project_id, chat_id, assistant_path, "assistant", answer, metadata,
-        )
-    return {"user_message": user_msg, "assistant_message": assistant_msg,
-            "cited": cited, "retrieved": retrieved, **extra}
+        # retrieved = everything we put in front of the model; cited = the subset it
+        # actually referenced via [S#] markers (parsed from the answer).
+        retrieved = [{"id": c["id"], "path": c["path"]} for c in retrieval.chunks]
+        cited = cited_chunks(answer, retrieval.chunks)
+        # Command-specific structured output (e.g. the parsed mock-exam questions).
+        extra = command.parse(answer) if command and command.parse else {}
+        metadata = {"strategy": retrieval.strategy, "retrieval_tokens": retrieval.token_count,
+                    "retrieved": retrieved, "cited": cited, "level": level, **extra}
+        if command:
+            metadata["command"] = command.name
+        tr.set(strategy=retrieval.strategy, retrieval_tokens=retrieval.token_count,
+               cited=[c["path"] for c in cited])
+        tr.write("answer.md", f"# Answer\n\n{answer}\n\n---\n\n"
+                 f"**strategy**: `{retrieval.strategy}`  "
+                 f"**retrieved**: {len(retrieved)}  **cited**: {len(cited)}\n\n"
+                 + "\n".join(f"- [S?] cited `{c['path']}`" for c in cited))
+        async with acquire() as conn:
+            assistant_path = await _next_child_path(conn, chat_id, user_path)
+            assistant_msg = await _insert_message(
+                conn, project_id, chat_id, assistant_path, "assistant", answer, metadata,
+            )
+        return {"user_message": user_msg, "assistant_message": assistant_msg,
+                "cited": cited, "retrieved": retrieved, **extra}
 
 
 @router.get("/{chat_id}/messages")

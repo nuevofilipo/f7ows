@@ -1,0 +1,76 @@
+@import "tailwindcss";
+@import "katex/dist/katex.min.css";
+@plugin '@tailwindcss/typography';
+
+/* Design tokens straight from the Figma (#0f0f0f bg, #f5f4f5 fg, #ed4bc7 accent). */
+@theme {
+  --color-ink: #0f0f0f;
+  --color-paper: #f5f4f5;
+  --color-accent: #ed4bc7;
+  --font-sans: Arial, Helvetica, sans-serif;
+}
+
+html,
+body {
+  background-color: var(--color-ink);
+  color: var(--color-paper);
+  font-family: var(--font-sans);
+}
+
+/* Clean minimal scrollbar: a small light thumb on the bare dark background,
+   no track, no arrows. Applied to the whole page (html) and to any scrollable
+   pane tagged .scroll-clean, so the ugly default never shows. WebKit + Firefox. */
+html,
+.scroll-clean {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(245 244 245 / 0.6) transparent;
+}
+html::-webkit-scrollbar,
+.scroll-clean::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+html::-webkit-scrollbar-track,
+.scroll-clean::-webkit-scrollbar-track {
+  background: transparent;
+}
+html::-webkit-scrollbar-button,
+html::-webkit-scrollbar-button:single-button,
+html::-webkit-scrollbar-button:start,
+html::-webkit-scrollbar-button:end,
+.scroll-clean::-webkit-scrollbar-button,
+.scroll-clean::-webkit-scrollbar-button:single-button,
+.scroll-clean::-webkit-scrollbar-button:start,
+.scroll-clean::-webkit-scrollbar-button:end {
+  display: none;
+  width: 0;
+  height: 0;
+  background: transparent;
+}
+html::-webkit-scrollbar-thumb,
+.scroll-clean::-webkit-scrollbar-thumb {
+  background-color: rgb(245 244 245 / 0.6);
+  border-radius: 9999px;
+}
+html::-webkit-scrollbar-thumb:hover,
+.scroll-clean::-webkit-scrollbar-thumb:hover {
+  background-color: rgb(245 244 245 / 0.85);
+}
+
+/* Make rendered chat markdown (the `prose` block) legible on the dark theme. */
+.prose-chat {
+  color: var(--color-paper);
+}
+.prose-chat :where(h1, h2, h3, h4, strong) {
+  color: var(--color-paper);
+}
+.prose-chat :where(a) {
+  color: var(--color-accent);
+}
+.prose-chat :where(code) {
+  color: var(--color-paper);
+}
+.prose-chat :where(p, ul, ol) {
+  margin-top: 0.5em;
+  margin-bottom: 0.5em;
+}
