@@ -19,6 +19,7 @@ from app.producer import close_redis_pool, create_redis_pool
 from app.library.documents import router as documents_router
 from app.library.projects import router as projects_router
 from app.preferences.api import router as settings_router
+from app.projections import router as projection_router
 
 
 @asynccontextmanager
@@ -56,6 +57,7 @@ app.include_router(documents_router)
 app.include_router(chat_router)
 app.include_router(commands_router)
 app.include_router(settings_router)
+app.include_router(projection_router)
 
 
 @app.get("/healthz")

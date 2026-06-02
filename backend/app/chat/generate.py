@@ -29,13 +29,19 @@ _CITE_RE = re.compile(r"\[S(\d+)\]")
 
 
 def cited_chunks(answer: str, chunks: list[dict]) -> list[dict]:
-    """Map the [S#] markers the model wrote back to the chunks it actually used."""
+    """Map the [S#] markers the model wrote back to the chunks it actually used.
+
+    Each entry carries ``s`` (the original marker number, so the frontend can map
+    an inline ``[S#]`` straight to its chunk) plus the chunk ``text`` (whichever
+    content field the strategy populated), which drives the hover-to-peek popup.
+    """
     cited, seen = [], set()
     for num in sorted(int(n) for n in _CITE_RE.findall(answer)):
         if 1 <= num <= len(chunks):
             c = chunks[num - 1]
             if c["id"] not in seen:
-                cited.append({"id": c["id"], "path": c["path"]})
+                cited.append({"s": num, "id": c["id"], "path": c["path"],
+                              "text": c.get("content_full") or c.get("content_sparse") or ""})
                 seen.add(c["id"])
     return cited
 
@@ -51,6 +57,7 @@ async def grounded_answer(
     routing_query: str | None = None,
     model: str | None = None,
     max_tokens: int | None = None,
+    document_ids=None,
 ) -> GroundedAnswer:
     """Retrieve sources for ``query`` and generate one grounded answer.
 
@@ -61,10 +68,12 @@ async def grounded_answer(
     intent classification + planning, while the answer is still grounded on the
     real ``query`` — slash commands use this to inject their keyword so they reach
     the LLM classifier instead of being mis-read as a specific lookup.
+    ``document_ids`` scopes retrieval to the user's selected sources (None = all).
     """
     retrieval = await route(project_id, routing_query or query, intent=intent,
                             k=prefs.retrieval_k, budget=prefs.retrieval_budget,
-                            planner_max_tokens=prefs.planner_max_tokens)
+                            planner_max_tokens=prefs.planner_max_tokens,
+                            document_ids=document_ids)
     messages = [{"role": "system", "content": system_prompt}]
     messages += [{"role": h["role"], "content": h["content"]} for h in history]
     messages.append({"role": "user", "content": f"# Sources\n{retrieval.context}\n\n# Question\n{query}"})

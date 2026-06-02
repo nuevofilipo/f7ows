@@ -78,6 +78,31 @@ async def _owned_project(project_id: UUID, user_id) -> None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Project not found")
 
 
+async def _validate_source_ids(project_id: UUID, raw) -> list[UUID] | None:
+    """Coerce a body ``source_ids`` list to project-owned document UUIDs.
+
+    Returns the validated ids, or None when none are given/valid (= whole project).
+    Silently drops malformed or foreign ids so a stale selection can't 422 a send.
+    """
+    if not isinstance(raw, list) or not raw:
+        return None
+    parsed = []
+    for x in raw:
+        try:
+            parsed.append(UUID(str(x)))
+        except (ValueError, TypeError):
+            continue
+    if not parsed:
+        return None
+    async with acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id FROM documents WHERE project_id = $1 AND id = ANY($2::uuid[])",
+            project_id, parsed,
+        )
+    valid = [r["id"] for r in rows]
+    return valid or None
+
+
 async def _next_child_path(conn, chat_id: UUID, parent_path: str | None) -> str:
     """The next sibling ltree path under ``parent_path`` (or at the chat root)."""
     if parent_path is None:
@@ -117,9 +142,11 @@ async def send_message(
 ) -> dict:
     """Post a message and get a grounded assistant reply.
 
-    Body: ``{content, parent_path?, intent?, scope?}``. Omit ``parent_path`` to
-    continue the chat linearly; pass one to branch a nested reply. ``intent`` /
-    ``scope`` override the retrieval router heuristics (see app.retrieval.route).
+    Body: ``{content, parent_path?, intent?, scope?, source_ids?}``. Omit
+    ``parent_path`` to continue the chat linearly; pass one to branch a nested
+    reply. ``intent`` / ``scope`` override the retrieval router heuristics (see
+    app.retrieval.route). ``source_ids`` scopes retrieval to the user's selected
+    documents (omit/empty = the whole project).
     """
     await _owned_project(project_id, current_user["id"])
     body = await request.json()
@@ -144,6 +171,12 @@ async def send_message(
     # classifier (the answer is still grounded on the real content).
     routing_query = (f"{content} {command.retrieval_keyword}"
                      if command and command.retrieval_keyword else None)
+
+    # Source scope: the documents the user has selected in the left panel. Validate
+    # the ids belong to this project, then pass them down to scope retrieval. None
+    # (no/invalid ids) means "the whole project" — the frontend blocks sending with
+    # an empty selection, so a scoped request always carries at least one valid id.
+    document_ids = await _validate_source_ids(project_id, body.get("source_ids"))
 
     # Visual hierarchy level (1=main thread, deeper on reply, capped at 3). The
     # frontend computes it from the two send buttons; we persist it on both the
@@ -188,7 +221,7 @@ async def send_message(
                 conn, project_id, chat_id, assistant_path, "assistant", "",
                 {"state": "generating", "command": command.name, "level": level},
             )
-        _spawn(command.runner(project_id, content, prefs, assistant_msg["id"]))
+        _spawn(command.runner(project_id, content, prefs, assistant_msg["id"], document_ids))
         return {"user_message": user_msg, "assistant_message": assistant_msg}
 
     # Synchronous path: retrieve + generate one grounded answer.
@@ -199,7 +232,8 @@ async def send_message(
                                                       command=command.name if command else None))
         try:
             result = await grounded_answer(project_id, content, prefs, system_prompt=system_prompt,
-                                           history=history, intent=intent, routing_query=routing_query)
+                                           history=history, intent=intent, routing_query=routing_query,
+                                           document_ids=document_ids)
         except LLMError as exc:
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"Chat model failed: {exc}")
         answer, retrieval = result.answer, result.retrieval
@@ -211,7 +245,8 @@ async def send_message(
         # Command-specific structured output (e.g. the parsed mock-exam questions).
         extra = command.parse(answer) if command and command.parse else {}
         metadata = {"strategy": retrieval.strategy, "retrieval_tokens": retrieval.token_count,
-                    "retrieved": retrieved, "cited": cited, "level": level, **extra}
+                    "retrieved": retrieved, "cited": cited, "level": level,
+                    "source_ids": [str(d) for d in document_ids] if document_ids else None, **extra}
         if command:
             metadata["command"] = command.name
         tr.set(strategy=retrieval.strategy, retrieval_tokens=retrieval.token_count,

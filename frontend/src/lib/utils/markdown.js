@@ -18,7 +18,21 @@ marked.use(
 export function renderMarkdown(src) {
 	const pre = normalizeDisplayMath(convertTexDelimiters(src ?? ''));
 	const html = marked.parse(pre, { async: false });
-	return DOMPurify.sanitize(/** @type {string} */ (html));
+	return DOMPurify.sanitize(injectCitations(/** @type {string} */ (html)));
+}
+
+/**
+ * Turn inline `[S#]` citation markers into small, hoverable elements. Run on the
+ * rendered HTML (pre-sanitize) so the marker survives DOMPurify, which keeps the
+ * `class`, `data-*` and `tabindex`. MessageBubble reads `data-cite` to show the
+ * chunk-peek popup; the `.cite` class styles it small + muted (see layout.css).
+ * @param {string} html
+ */
+function injectCitations(html) {
+	return html.replace(
+		/\[S(\d+)\]/g,
+		(_, n) => `<span class="cite" data-cite="${n}" tabindex="0">[S${n}]</span>`
+	);
 }
 
 /**

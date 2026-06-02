@@ -6,6 +6,7 @@
 	 * @type {{
 	 *   commands: { name: string, description: string }[],
 	 *   sending?: boolean,
+	 *   canSend?: boolean,
 	 *   actionTarget?: { message: import('$lib/api/chats.js').Message, mode: 'reply' | 'continue' } | null,
 	 *   lastTokens?: number | null,
 	 *   onSend: (p: { content: string, command?: string }) => void,
@@ -15,6 +16,7 @@
 	let {
 		commands,
 		sending = false,
+		canSend = true,
 		actionTarget = null,
 		lastTokens = null,
 		onSend,
@@ -24,6 +26,31 @@
 	let text = $state('');
 	/** @type {string | null} */
 	let activeCommand = $state(null);
+
+	/** @type {HTMLTextAreaElement | undefined} */
+	let textarea = $state();
+	// Grow with content up to ~6 lines, then scroll within the box.
+	const MAX_HEIGHT = 160;
+	// The natural rows=2 height, captured on mount — the floor we never shrink past.
+	let minHeight = 0;
+
+	/** Resize the textarea to fit its content, clamped to [minHeight, MAX_HEIGHT]. */
+	function autoresize() {
+		if (!textarea) return;
+		textarea.style.height = 'auto';
+		const fit = Math.min(Math.max(textarea.scrollHeight, minHeight), MAX_HEIGHT);
+		textarea.style.height = `${fit}px`;
+	}
+
+	// Capture the rendered 2-row height as the floor, then fit on every change
+	// (typing, and the reset back to empty after submit).
+	$effect(() => {
+		if (textarea && !minHeight) minHeight = textarea.clientHeight;
+	});
+	$effect(() => {
+		text;
+		autoresize();
+	});
 
 	// Show the command menu while the user is typing a leading "/token".
 	const slashQuery = $derived(/^\/(\w*)$/.exec(text.trimStart())?.[1] ?? null);
@@ -40,7 +67,7 @@
 
 	function submit() {
 		const content = text.trim();
-		if (!content || sending) return;
+		if (!content || sending || !canSend) return;
 		onSend({ content, command: activeCommand ?? undefined });
 		text = '';
 		activeCommand = null;
@@ -90,27 +117,36 @@
 		</div>
 	{/if}
 
-	<textarea
-		bind:value={text}
-		onkeydown={onKeydown}
-		rows="2"
-		disabled={sending}
-		placeholder="type your prompt, or type / to see available functions"
-		class="w-full resize-none bg-transparent px-4 py-3 text-[15px] text-paper placeholder:text-paper/40 focus:outline-none"
-	></textarea>
+	<!-- Cut vertically: textarea takes the full height on the left; the Send button
+	     sits at the top of a narrow right column with the token count beneath it. -->
+	<div class="flex items-stretch">
+		<textarea
+			bind:this={textarea}
+			bind:value={text}
+			onkeydown={onKeydown}
+			oninput={autoresize}
+			rows="2"
+			disabled={sending}
+			placeholder="type your prompt, or type / to see available functions"
+			class="scroll-clean min-w-0 flex-1 resize-none overflow-y-auto bg-transparent px-4 py-3 text-[15px] text-paper placeholder:text-paper/40 focus:outline-none"
+			style="max-height: {MAX_HEIGHT}px"
+		></textarea>
 
-	<div class="flex items-center justify-end px-4 pb-2 text-xs text-paper/60">
-		<div class="flex items-center gap-3">
-			{#if lastTokens != null}
-				<span>{lastTokens.toLocaleString()} ctx tokens</span>
-			{/if}
+		<div class="flex shrink-0 flex-col items-end gap-1 p-2">
 			<button
 				class="bg-accent px-4 py-1 text-paper disabled:opacity-40"
-				disabled={sending || !text.trim()}
+				disabled={sending || !text.trim() || !canSend}
 				onclick={submit}
 			>
 				{sending ? '…' : 'Send'}
 			</button>
+			{#if lastTokens != null}
+				<span class="text-xs text-paper/60">{lastTokens.toLocaleString()} ctx/$0.00</span>
+			{/if}
 		</div>
 	</div>
+
+	{#if !canSend}
+		<div class="px-4 pb-1 text-xs text-paper/50">select at least one source to send</div>
+	{/if}
 </div>

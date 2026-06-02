@@ -137,7 +137,7 @@ def _assemble(rows, *, budget: int) -> tuple[str, list[dict], int]:
 
 
 # ── strategy 1: specific lookup ─────────────────────────────────────────────
-async def _specific(project_id, query: str, k: int) -> RetrievalResult:
+async def _specific(project_id, query: str, k: int, document_ids=None) -> RetrievalResult:
     [vector] = await embed([query])
     async with acquire() as conn:
         rows = await conn.fetch(
@@ -145,10 +145,11 @@ async def _specific(project_id, query: str, k: int) -> RetrievalResult:
             SELECT c.id, c.path, c.content_full, (c.embedding <=> $2::halfvec) AS distance
             FROM chunks c JOIN documents d ON d.id = c.document_id
             WHERE d.project_id = $1 AND c.embedding IS NOT NULL
+              AND ($4::uuid[] IS NULL OR d.id = ANY($4::uuid[]))
             ORDER BY c.embedding <=> $2::halfvec
             LIMIT $3
             """,
-            project_id, vector, k,
+            project_id, vector, k, document_ids,
         )
     chunks = [{"id": str(r["id"]), "path": str(r["path"]), "content_full": r["content_full"],
                "distance": float(r["distance"])} for r in rows]
@@ -157,16 +158,17 @@ async def _specific(project_id, query: str, k: int) -> RetrievalResult:
 
 
 # ── strategy 2: brute-force stuffing ────────────────────────────────────────
-async def _stuff(project_id, budget: int) -> RetrievalResult:
+async def _stuff(project_id, budget: int, document_ids=None) -> RetrievalResult:
     async with acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT c.id, c.path, c.content_sparse
             FROM chunks c JOIN documents d ON d.id = c.document_id
             WHERE d.project_id = $1 AND c.content_sparse IS NOT NULL
+              AND ($2::uuid[] IS NULL OR d.id = ANY($2::uuid[]))
             ORDER BY c.path
             """,
-            project_id,
+            project_id, document_ids,
         )
     context, chunks, total = _assemble(rows, budget=budget)
     return RetrievalResult("stuff", context, chunks, total, {"available": len(rows)})
@@ -183,7 +185,8 @@ _PLANNER_SYSTEM = (
 )
 
 
-async def _skeleton(project_id, query: str, budget: int, planner_max_tokens: int) -> RetrievalResult:
+async def _skeleton(project_id, query: str, budget: int, planner_max_tokens: int,
+                    document_ids=None) -> RetrievalResult:
     from app.llm import LLMError, complete
 
     async with acquire() as conn:
@@ -192,9 +195,10 @@ async def _skeleton(project_id, query: str, budget: int, planner_max_tokens: int
             SELECT DISTINCT c.path
             FROM chunks c JOIN documents d ON d.id = c.document_id
             WHERE d.project_id = $1 AND c.path IS NOT NULL
+              AND ($2::uuid[] IS NULL OR d.id = ANY($2::uuid[]))
             ORDER BY c.path
             """,
-            project_id,
+            project_id, document_ids,
         )]
     if not toc:
         return RetrievalResult("skeleton", "", [], 0, {"reason": "empty toc"})
@@ -212,7 +216,7 @@ async def _skeleton(project_id, query: str, budget: int, planner_max_tokens: int
         selected = [p for p in json.loads(reply[reply.index("["): reply.rindex("]") + 1]) if p in toc]
     except (LLMError, ValueError, json.JSONDecodeError) as exc:
         logger.warning("skeleton planner failed (%s); falling back to budget-capped stuff", exc)
-        result = await _stuff(project_id, budget)
+        result = await _stuff(project_id, budget, document_ids)
         result.meta["fellback_from"] = "skeleton"
         return result
 
@@ -225,9 +229,10 @@ async def _skeleton(project_id, query: str, budget: int, planner_max_tokens: int
             SELECT c.id, c.path, c.content_sparse
             FROM chunks c JOIN documents d ON d.id = c.document_id
             WHERE d.project_id = $1 AND c.path <@ ANY($2::ltree[])
+              AND ($3::uuid[] IS NULL OR d.id = ANY($3::uuid[]))
             ORDER BY c.path
             """,
-            project_id, selected,
+            project_id, selected, document_ids,
         )
     context, chunks, total = _assemble(rows, budget=budget)
     return RetrievalResult("skeleton", context, chunks, total,
@@ -243,6 +248,7 @@ async def route(
     k: int = 8,
     budget: int = DEFAULT_BUDGET,
     planner_max_tokens: int = 2000,
+    document_ids=None,
 ) -> RetrievalResult:
     """Pick and run a retrieval strategy for ``query`` over ``project_id``.
 
@@ -254,6 +260,8 @@ async def route(
         budget: sparse-token threshold (stuff vs skeleton for global); also caps
                 how much context is assembled.
         planner_max_tokens: max tokens for the planner / classifier LLM calls.
+        document_ids: optional list of document UUIDs to scope retrieval to (the
+                user's selected sources). None = the whole project.
 
     Returns:
         A RetrievalResult with the assembled context and the chunks it used.
@@ -262,11 +270,11 @@ async def route(
         intent = "specific" if _is_specific(query) else await _llm_classify_scope(query, planner_max_tokens)
 
     if intent == "specific":
-        result = await _specific(project_id, query, k)
+        result = await _specific(project_id, query, k, document_ids)
     elif intent == "inbetween":
         # Focus on the relevant topic, regardless of corpus size — never stuff the
         # whole project for a topic question.
-        result = await _skeleton(project_id, query, budget, planner_max_tokens)
+        result = await _skeleton(project_id, query, budget, planner_max_tokens, document_ids)
     else:  # global
         # Estimate corpus size cheaply: if the whole thing fits, stuff it (highest
         # fidelity); otherwise the skeleton selects branches and caps to budget,
@@ -277,12 +285,13 @@ async def route(
                 SELECT COALESCE(SUM(length(c.content_sparse)), 0)
                 FROM chunks c JOIN documents d ON d.id = c.document_id
                 WHERE d.project_id = $1
+                  AND ($2::uuid[] IS NULL OR d.id = ANY($2::uuid[]))
                 """,
-                project_id,
+                project_id, document_ids,
             )
         corpus_tokens = int(chars) // _CHARS_PER_TOKEN
-        result = (await _stuff(project_id, budget) if corpus_tokens <= budget
-                  else await _skeleton(project_id, query, budget, planner_max_tokens))
+        result = (await _stuff(project_id, budget, document_ids) if corpus_tokens <= budget
+                  else await _skeleton(project_id, query, budget, planner_max_tokens, document_ids))
         result.meta["corpus_tokens"] = corpus_tokens
 
     result.meta["intent"] = intent

@@ -1,3 +1,65 @@
+2026-06-02 — Hover-to-peek inline source citations
+==================================================
+
+WHAT
+- Inline [S#] markers are now the ONLY citation UI (the chip list under each
+  answer is gone) and hovering one fades in a popup showing that chunk's text +
+  path — NotebookLM-style — so a citation actually lets you peek at the source.
+
+WHY / HOW
+- backend generate.py cited_chunks(): each cited entry now carries `s` (the
+  original marker number, so the frontend maps [S#] -> chunk directly despite the
+  dedupe/re-sort) and `text` (content_full or content_sparse, whichever the
+  strategy populated). Persisted in message.metadata.cited, so it survives reload.
+  Only the *cited* subset carries text, keeping metadata lean.
+- frontend markdown.js: injectCitations() rewrites [S#] -> <span class="cite"
+  data-cite=#> on the rendered HTML pre-sanitize (DOMPurify keeps class/data-*/
+  tabindex). layout.css styles .cite small + secondary grey so it doesn't disturb
+  reading (brighter on hover/focus, no pink).
+- frontend MessageBubble.svelte: builds a Map<s, chunk>; event-delegated
+  mouseover/focusin on the prose shows a single fade-in popup positioned under the
+  marker (clamped to container), scrollable + hoverable with a 120ms close delay.
+  Removed Citations.svelte (deleted; nothing else used it).
+- KNOWN LIMIT: /deepsummary re-numbers [S#] per section, so its assembled doc
+  won't map cleanly yet — scoped out of this pass.
+
+2026-06-02 — Per-message source scoping (selectable sources)
+============================================================
+
+WHAT
+- Retrieval can now be scoped to a user-selected subset of documents instead of
+  always the whole project. One new parameter, document_ids, threaded from the
+  chat endpoint down through the single retrieval chokepoint:
+    chat.send_message -> grounded_answer -> retrieval.route -> all 4 strategies.
+- retrieval_router.py: added `document_ids` to route() and _specific/_stuff/
+  _skeleton (toc + branch fetch) and the global corpus-size estimate. Each SQL
+  join gained `AND ($n::uuid[] IS NULL OR d.id = ANY($n::uuid[]))` — None means
+  "whole project" (back-compat), a non-empty list scopes to those docs.
+- chat.py: new _validate_source_ids() coerces body.source_ids to project-owned
+  UUIDs (silently drops malformed/foreign ids so a stale selection can't 422 a
+  send); threaded into the sync grounded_answer call, the background command
+  runner, and persisted on the assistant message metadata as source_ids.
+- deepsummary.run/_outline/_section + commands.Command.runner signature gained
+  document_ids so the background command path respects the selection too.
+- Frontend: new stores/sources.svelte.js (SvelteSet singleton) holds the
+  selection — sticky across chat switches, re-seeded per project, auto-selects
+  newly-ready docs while honouring manual deselects. SourcesPanel renders a
+  rectangular checkbox per ready source (shared border + a smaller pink square
+  offset to the upper-left when selected) and an all/none control. ChatPanel
+  passes sources.selectedIds into send and sources.hasSelection -> Composer,
+  which disables Send (with a hint) when nothing is selected.
+
+WHY
+- TODO_manual.md: "make the sources on the left selectable and then only give the
+  current message access to those selected sources." Mirrors NotebookLM source
+  selection; lets a STEM user narrow retrieval to the doc(s) they're studying.
+- Empty selection blocks sending (per product decision) so a query is never run
+  ungrounded by accident; default is all-ready-selected so it works out of the box.
+
+VERIFIED
+- backend: py_compile clean on all 5 touched modules.
+- frontend: `npm run check` 0 errors (same 4 pre-existing benign warnings).
+
 2026-06-01 — Transparent tracing + HTTP testsuite
 =================================================
 
@@ -266,3 +328,93 @@ VERIFIED
 NOTE
 - Drag widths are session-only (not persisted). If they should survive reloads,
   stash them in localStorage — easy follow-up.
+
+================================================================================
+2026-06-03 — Projection page (map UI), full stack
+================================================================================
+WHAT
+- New backend read API for the map (app/projections/api.py), wired into main.py and
+  exported from app/projections/__init__.py alongside compute():
+    GET /projects/{id}/projection
+      -> { ready, chunks:[{ id, document_name, path, heading_trail, token_count,
+           study, coords:{ umap_2d, pca, tsne } }] }
+      Serves the per-chunk 2D coords the worker already precomputes. `ready` is
+      false until any chunk has coords (fresh project) so the UI shows an empty
+      state instead of a blank canvas. study_status JSONB is collapsed into
+      actively_recalled | summarised | not_studied via _study_state(); nothing
+      writes study_status yet so all chunks read not_studied for now — the
+      convention ({"state": "..."}) is fixed in code so the future marking path
+      just has to match it.
+    GET /projects/{id}/projection/search?q=&method=cosine|bm25
+      -> { method, query, matches:[{ id, score }] }
+      cosine = embed(q) + pgvector cosine over embedding; bm25 = ts_rank over the
+      existing FTS index on content_full. Capped at 100 ids; the map rings them.
+  Both endpoints are owner-checked (_owned_project, 404) mirroring documents.py.
+- Frontend: lib/api/projection.js (getProjection / searchProjection);
+  routes/projects/[projectId]/projection/+page.svelte (top bar + map + Settings
+  sidebar + legend, same load/auth pattern as the notebook page);
+  lib/components/projection/ProjectionMap.svelte (SVG scatter — fits the cloud to
+  measured pixels, point size by token_count, colour by study state, search ring +
+  dim, hover label). Enabled the previously-disabled "Projection" link in
+  NotebookShell to navigate to the new route.
+
+WHY
+- The worker has been computing per-chunk projections + clusters all along but
+  nothing exposed them. This delivers the PRD "Projection Page": switch UMAP/PCA/
+  t-SNE, see chunks laid out in 2D coloured by study state, and search (semantic or
+  keyword) to highlight matches on the map.
+
+DECISIONS
+- Map nodes are individual CHUNKS (user's call), not cluster bubbles — so study
+  colour is exact per chunk and no cluster-membership persistence is needed.
+- 2D only this pass (design has no 3D toggle); umap_3d exists in the data so a 3D
+  mode is an easy follow-up.
+
+VERIFIED
+- Backend: `python -c "import app.main"` OK; both projection routes registered.
+- Frontend: `npm run check` 0 errors (same 4 pre-existing benign warnings);
+  svelte-autofixer clean on the new components.
+
+NOTE
+- study_status is never written yet, so everything renders "not studied". Wiring
+  quiz/mock-exam (active) and summary/chat (passive) to stamp study_status is the
+  natural next step to make the legend colours light up.
+
+================================================================================
+2026-06-03 — Projection map: zoom/pan + 3D, unified on three.js
+================================================================================
+WHAT
+- Backend: projection endpoint now also returns umap_3d in coords (SELECT c.umap_3d
+  added; coords -> { umap_2d, umap_3d, pca, tsne }; ready check includes it). The
+  worker already writes umap_3d, it just wasn't exposed.
+- Frontend: replaced the hand-rolled SVG ProjectionMap with a single three.js
+  (WebGL) renderer covering all four modes:
+    * 2D (umap_2d/pca/tsne): OrthographicCamera — left-drag pans, wheel zooms
+      (point size grows with camera.zoom, mirroring the old SVG feel).
+    * 3D (umap_3d): PerspectiveCamera + OrbitControls — left-drag rotates, wheel
+      zooms, right-drag pans.
+  One THREE.Points cloud + a small custom ShaderMaterial keeps the design's study
+  coding without a mesh per chunk: aStyle 0=filled disc / 1=ring, aColor per point
+  (accent vs paper), aHit -> solid bright accent disc for search matches while
+  non-hits dim (uSearchActive). Round points + ring via gl_PointCoord. Size from
+  token_count. Hover hit-tests in screen space -> the existing corner label.
+  Camera auto-fits the cloud; "reset view" button re-fits; mode-aware hint text.
+  Added "UMAP 3D" to the Settings method picker.
+- Dependency: added `three` (+ @types/three). Used only by ProjectionMap.
+
+WHY
+- Requested: zoom-by-scroll + drag-to-move, and we already had 3D coordinates
+  computed. SVG can't rotate a point cloud, so per the user's choice we unified the
+  whole map on three.js — one renderer, consistent interaction, scales to many
+  points, and 3D comes "for free" via OrbitControls.
+
+NOTES
+- ColorManagement disabled so the raw sRGB token values (#ed4bc7 / #f5f4f5) render
+  exactly as in CSS.
+- The canvas lives in its own child div (bind:this) kept free of Svelte-managed
+  children, so Svelte never reconciles DOM that three.js owns.
+
+VERIFIED
+- `npm run check` 0 errors (same 4 pre-existing benign warnings); `npm run build`
+  succeeds (three + three/addons bundle); svelte-autofixer clean (remaining notes
+  are the legitimate $effect->imperative-three sync); backend imports OK.

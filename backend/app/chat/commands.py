@@ -35,7 +35,7 @@ class Command:
     # Background commands (e.g. deepsummary) are multi-pass: send_message inserts a
     # placeholder assistant message and spawns ``runner`` instead of replying inline.
     background: bool = False
-    runner: Callable | None = None             # async (project_id, topic, prefs, message_id)
+    runner: Callable | None = None             # async (project_id, topic, prefs, message_id, document_ids)
 
 
 # ── /mockexam ───────────────────────────────────────────────────────────────

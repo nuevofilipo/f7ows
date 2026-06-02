@@ -52,8 +52,9 @@ export class ChatStore {
 	 * @param {string} [opts.parentPath]
 	 * @param {string} [opts.intent]
 	 * @param {number} [opts.level]  visual hierarchy level for the new turn (1–3)
+	 * @param {string[]} [opts.sourceIds]  documents to scope retrieval to
 	 */
-	async send({ content, command, parentPath, intent, level = 1 }) {
+	async send({ content, command, parentPath, intent, level = 1, sourceIds }) {
 		this.sending = true;
 		this.error = null;
 
@@ -84,7 +85,8 @@ export class ChatStore {
 				level,
 				...(command ? { command } : {}),
 				...(parentPath ? { parent_path: parentPath } : {}),
-				...(intent ? { intent } : {})
+				...(intent ? { intent } : {}),
+				...(sourceIds?.length ? { source_ids: sourceIds } : {})
 			});
 			// Swap the placeholders for the real messages.
 			this.messages = drop(this.messages).concat([res.user_message, res.assistant_message]);

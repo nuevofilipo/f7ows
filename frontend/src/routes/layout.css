@@ -74,3 +74,18 @@ html::-webkit-scrollbar-thumb:hover,
   margin-top: 0.5em;
   margin-bottom: 0.5em;
 }
+
+/* Inline [S#] source citations: small + muted secondary grey so they don't
+   disturb the reading; they're the hover targets for the chunk-peek popup. */
+.prose-chat .cite {
+  font-size: 0.82em;
+  color: rgb(245 244 245 / 0.55);
+  cursor: help;
+  white-space: nowrap;
+  padding: 0 1px;
+}
+.prose-chat .cite:hover,
+.prose-chat .cite:focus {
+  color: rgb(245 244 245 / 0.9);
+  outline: none;
+}
