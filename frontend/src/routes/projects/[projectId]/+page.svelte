@@ -8,6 +8,9 @@
 
 	const projectId = $derived(page.params.projectId ?? '');
 
+	/** localStorage key for the last chat the user had open in a given project. */
+	const lastChatKey = (/** @type {string} */ pid) => `notebook:lastChat:${pid}`;
+
 	let projectName = $state('Notebook');
 	/** @type {import('$lib/api/chats.js').ChatSummary[]} */
 	let chats = $state([]);
@@ -25,15 +28,27 @@
 				// No "get one project" endpoint — find its name in the list.
 				const [projects, chatList] = await Promise.all([listProjects(), listChats(projectId)]);
 				projectName = projects.find((p) => p.id === projectId)?.name ?? 'Notebook';
-				chats = chatList;
-				// Open the most recent chat, or start a fresh client-generated one.
-				chatId = chatList[0]?.chat_id ?? crypto.randomUUID();
+				// Most-recent-first, so the freshest chat is the natural default.
+				chats = [...chatList].sort((a, b) =>
+					(b.last_activity ?? '').localeCompare(a.last_activity ?? '')
+				);
+				// Reopen the chat the user last had open here (if it still exists),
+				// else the most recent, else start a fresh client-generated one.
+				const remembered = localStorage.getItem(lastChatKey(projectId));
+				const exists = remembered && chats.some((c) => c.chat_id === remembered);
+				chatId = (exists && remembered) || chats[0]?.chat_id || crypto.randomUUID();
 			} catch (/** @type {any} */ err) {
 				error = err?.message ?? 'Failed to load notebook';
 			} finally {
 				loading = false;
 			}
 		})();
+	});
+
+	// Remember the open chat per project so a reload reopens it (effects are
+	// browser-only, so localStorage is safe here).
+	$effect(() => {
+		if (chatId && projectId) localStorage.setItem(lastChatKey(projectId), chatId);
 	});
 
 	/** @param {string} id */

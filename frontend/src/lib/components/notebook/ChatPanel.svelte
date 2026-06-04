@@ -1,8 +1,10 @@
 <script>
   import { ChatStore, buildTree } from "$lib/stores/chat.svelte.js";
   import { sources } from "$lib/stores/sources.svelte.js";
+  import { getSettings, updateSettings } from "$lib/api/settings.js";
   import MessageThread from "$lib/components/chat/MessageThread.svelte";
   import Composer from "$lib/components/chat/Composer.svelte";
+  import ModelSelect from "./ModelSelect.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
 
   /**
@@ -30,6 +32,24 @@
   });
 
   const tree = $derived(buildTree(store.messages));
+
+  // Quick model switch (header). Seed from the user's effective settings; a change
+  // persists immediately so it applies to the next turn — even mid-session.
+  let chatModel = $state("");
+  $effect(() => {
+    getSettings()
+      .then((s) => (chatModel = s.effective.chat_model))
+      .catch(() => {});
+  });
+  /** @param {string} id */
+  async function changeModel(id) {
+    chatModel = id;
+    try {
+      await updateSettings({ chat_model: id });
+    } catch {
+      /* non-fatal; the model just won't persist */
+    }
+  }
 
   /** @type {HTMLElement | undefined} */
   let scroller = $state();
@@ -63,6 +83,17 @@
     return null;
   });
 
+  // Running dollar total for this chat — sum of the per-message cost the backend
+  // records from OpenRouter's reported usage.cost (see app/cost.py).
+  const chatCost = $derived.by(() => {
+    let sum = 0;
+    for (const m of store.messages) {
+      const c = m.metadata?.cost;
+      if (typeof c === "number") sum += c;
+    }
+    return sum;
+  });
+
   /** @param {{ content: string, command?: string }} p */
   async function handleSend({ content, command }) {
     /** @type {string | undefined} */
@@ -93,8 +124,10 @@
         value={chatId}
         onchange={(e) => onSelectChat(/** @type {HTMLSelectElement} */ (e.currentTarget).value)}
       >
-        {#each chats as c (c.chat_id)}
-          <option value={c.chat_id}>chat · {c.message_count} msgs</option>
+        <!-- Number oldest→newest so each chat keeps a stable label as new ones are
+             added (the list arrives most-recent-first). -->
+        {#each chats as c, i (c.chat_id)}
+          <option value={c.chat_id}>Chat {chats.length - i} · {c.message_count} msgs</option>
         {/each}
         {#if !chats.find((c) => c.chat_id === chatId)}
           <option value={chatId}>new chat</option>
@@ -102,7 +135,15 @@
       </select>
       <button class="text-sm text-paper/60 hover:text-accent" onclick={onNewChat}>+ new chat</button>
     </div>
-    <button class="bg-accent px-3 py-1 text-[16px] text-paper hover:opacity-90" onclick={() => onOpenSettings?.()}> Chat Settings </button>
+    <div class="flex items-center gap-2">
+      <!-- Quick model switch — same picker as Chat Settings, persisted on change. -->
+      <div class="w-44">
+        {#if chatModel}
+          <ModelSelect value={chatModel} onChange={changeModel} compact align="right" />
+        {/if}
+      </div>
+      <button class="bg-accent px-3 py-1 text-[16px] text-paper hover:opacity-90" onclick={() => onOpenSettings?.()}> Chat Settings </button>
+    </div>
   </header>
 
   <div bind:this={scroller} class="scroll-clean min-h-0 flex-1 overflow-y-auto px-5 py-5">
@@ -126,6 +167,7 @@
     canSend={sources.hasSelection}
     {actionTarget}
     {lastTokens}
+    {chatCost}
     onSend={handleSend}
     onCancelAction={() => (actionTarget = null)}
   />

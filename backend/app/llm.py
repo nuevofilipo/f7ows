@@ -11,6 +11,7 @@ import logging
 
 import httpx
 
+from app import apikey, cost
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -37,19 +38,25 @@ async def complete(
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
+        # Ask OpenRouter to return the real dollar cost of this generation in the
+        # response `usage.cost`, which we accumulate per request (see app.cost).
+        "usage": {"include": True},
     }
     # Optional sampling controls — only sent when set (top_k=0 means "off").
     if top_p is not None:
         payload["top_p"] = top_p
     if top_k:
         payload["top_k"] = top_k
-    headers = {"Authorization": f"Bearer {settings.openrouter_key}"}
+    headers = {"Authorization": f"Bearer {apikey.current_key()}"}
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(url, json=payload, headers=headers)
             if resp.status_code != 200:
                 raise LLMError(f"chat request failed ({resp.status_code}): {resp.text[:300]}")
-            content = resp.json()["choices"][0]["message"]["content"]
+            data = resp.json()
+            # Record the real dollar cost (we were charged even if content is empty).
+            cost.add((data.get("usage") or {}).get("cost"))
+            content = data["choices"][0]["message"]["content"]
             # Reasoning models can return 200 with empty content when max_tokens is
             # too small (the budget is spent on reasoning) — treat that as an error
             # rather than silently passing None/"" downstream.
@@ -58,3 +65,22 @@ async def complete(
             return content
     except (httpx.HTTPError, KeyError, IndexError) as exc:
         raise LLMError(f"chat completion failed: {exc}") from exc
+
+
+async def list_models(*, timeout: float = 15.0) -> list[dict]:
+    """Fetch the catalogue of models available on the gateway (OpenRouter's
+    ``/models``). Returns the raw ``data`` list; the caller trims it. The key is
+    sent for consistency/BYOK context even though the endpoint is public."""
+    url = f"{settings.llm_base_url.rstrip('/')}/models"
+    headers = {"Authorization": f"Bearer {apikey.current_key()}"}
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                raise LLMError(f"models request failed ({resp.status_code}): {resp.text[:300]}")
+            data = resp.json().get("data")
+            if not isinstance(data, list):
+                raise LLMError("models response missing a 'data' list")
+            return data
+    except (httpx.HTTPError, ValueError) as exc:
+        raise LLMError(f"listing models failed: {exc}") from exc

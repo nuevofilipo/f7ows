@@ -4,6 +4,7 @@
 	import { session } from '$lib/stores/session.svelte.js';
 	import { listProjects } from '$lib/api/projects.js';
 	import { getProjection, searchProjection } from '$lib/api/projection.js';
+	import { getSettings, updateSettings } from '$lib/api/settings.js';
 	import ProjectionMap from '$lib/components/projection/ProjectionMap.svelte';
 	import Spinner from '$lib/components/ui/Spinner.svelte';
 	import { SvelteSet } from 'svelte/reactivity';
@@ -21,6 +22,11 @@
 	// Which reduction to plot. Single-select, like the design's checkboxes.
 	/** @type {'umap_2d'|'pca'|'tsne'} */
 	let method = $state('umap_2d');
+
+	// Layout controls. `declutter` runs the non-overlap relaxation; `anchorStrength`
+	// (0..1, medium by default) trades UMAP-shape fidelity against airier spacing.
+	let declutter = $state(true);
+	let anchorStrength = $state(0.5);
 	const METHODS = /** @type {const} */ ([
 		['umap_2d', 'UMAP Projection'],
 		['pca', 'PCA Projection'],
@@ -32,10 +38,20 @@
 	let query = $state('');
 	/** @type {'cosine'|'bm25'} */
 	let searchMethod = $state('cosine');
+	// How many top matches the search highlights (top-k, no relevance floor).
+	let topK = $state(5);
 	// SvelteSet is reactive on its own; mutate in place rather than reassigning.
 	const highlight = new SvelteSet();
 	let searchActive = $state(false);
 	let searching = $state(false);
+
+	// Persisted projection knobs live in the user's preferences (projection group).
+	// `settingsReady` gates the auto-save effect until the stored values are applied,
+	// and `lastSavedSnapshot` suppresses the redundant write of the just-loaded values.
+	let settingsReady = $state(false);
+	let lastSavedSnapshot = '';
+	/** @type {ReturnType<typeof setTimeout>|undefined} */
+	let saveTimer;
 
 	$effect(() => {
 		if (!session.authenticated || !projectId) return;
@@ -43,19 +59,54 @@
 		(async () => {
 			try {
 				// No "get one project" endpoint — find its name in the list.
-				const [projects, projection] = await Promise.all([
+				const [projects, projection, settings] = await Promise.all([
 					listProjects(),
-					getProjection(projectId)
+					getProjection(projectId),
+					getSettings()
 				]);
 				projectName = projects.find((p) => p.id === projectId)?.name ?? 'Notebook';
 				chunks = projection.chunks;
 				ready = projection.ready;
+
+				// Apply stored projection preferences (fall back to the in-script defaults).
+				const e = settings.effective ?? {};
+				method = e.projection_method ?? method;
+				declutter = e.projection_declutter ?? declutter;
+				anchorStrength = e.projection_anchor_strength ?? anchorStrength;
+				searchMethod = e.projection_search_method ?? searchMethod;
+				topK = e.projection_search_k ?? topK;
+				lastSavedSnapshot = projectionSnapshot();
+				settingsReady = true;
 			} catch (/** @type {any} */ err) {
 				error = err?.message ?? 'Failed to load projection';
 			} finally {
 				loading = false;
 			}
 		})();
+	});
+
+	/** The five persisted knobs as a settings patch (stable key order for diffing). */
+	function projectionSnapshot() {
+		return JSON.stringify({
+			projection_method: method,
+			projection_declutter: declutter,
+			projection_anchor_strength: anchorStrength,
+			projection_search_method: searchMethod,
+			projection_search_k: topK
+		});
+	}
+
+	// Debounced auto-save: persist whenever a projection knob changes (no Save button).
+	$effect(() => {
+		const snapshot = projectionSnapshot();
+		if (!settingsReady || snapshot === lastSavedSnapshot) return;
+		clearTimeout(saveTimer);
+		saveTimer = setTimeout(() => {
+			lastSavedSnapshot = snapshot;
+			updateSettings(JSON.parse(snapshot)).catch((/** @type {any} */ err) => {
+				error = err?.message ?? 'Failed to save settings';
+			});
+		}, 500);
 	});
 
 	async function runSearch() {
@@ -67,7 +118,7 @@
 		}
 		searching = true;
 		try {
-			const res = await searchProjection(projectId, q, searchMethod);
+			const res = await searchProjection(projectId, q, searchMethod, topK);
 			highlight.clear();
 			for (const m of res.matches) highlight.add(m.id);
 			searchActive = true;
@@ -86,8 +137,8 @@
 	let profileOpen = $state(false);
 
 	const LEGEND = /** @type {const} */ ([
-		['actively_recalled', 'actively recalled'],
-		['summarised', 'summarised'],
+		['actively_studied', 'actively studied'],
+		['passively_studied', 'passively studied'],
 		['not_studied', 'not studied']
 	]);
 </script>
@@ -103,6 +154,7 @@
 				{#if profileOpen}
 					<div class="absolute right-0 z-50 mt-2 w-56 border border-paper bg-ink p-3 text-sm">
 						<p class="truncate text-paper/70">{session.user?.email}</p>
+						<a href="/profile" class="mt-2 block w-full border border-paper px-3 py-1 text-center text-paper hover:bg-paper/10">Settings</a>
 						<button class="mt-2 w-full bg-accent px-3 py-1 text-paper hover:opacity-90" onclick={logout}>
 							Log out
 						</button>
@@ -132,7 +184,7 @@
 						</p>
 					</div>
 				{:else}
-					<ProjectionMap {chunks} {method} {highlight} {searchActive} />
+					<ProjectionMap {projectId} {chunks} {method} {highlight} {searchActive} {declutter} {anchorStrength} />
 				{/if}
 
 				<!-- Legend, bottom-left over the canvas. -->
@@ -144,7 +196,7 @@
 									? 'border-paper'
 									: 'border-accent'}"
 							>
-								{#if key === 'actively_recalled'}<span class="h-full w-full bg-accent"></span>{/if}
+								{#if key === 'actively_studied'}<span class="h-full w-full bg-accent"></span>{/if}
 							</span>
 							{label}
 						</li>
@@ -174,6 +226,37 @@
 						</li>
 					{/each}
 				</ul>
+
+				<!-- Layout: declutter toggle + anchor-strength slider. -->
+				<h2 class="mt-6 text-[18px]">Layout</h2>
+				<button
+					type="button"
+					class="mt-3 flex w-full items-center gap-3 text-[15px]"
+					aria-pressed={declutter}
+					onclick={() => (declutter = !declutter)}
+				>
+					<span class="flex h-[19px] w-[19px] shrink-0 items-center justify-center border border-paper">
+						{#if declutter}<span class="h-3 w-3 bg-accent"></span>{/if}
+					</span>
+					Spread out (no overlap)
+				</button>
+
+				<div class="mt-3 {declutter ? '' : 'pointer-events-none opacity-40'}">
+					<div class="flex items-center justify-between text-[13px] text-paper/60">
+						<span>airier</span>
+						<span>keep shape</span>
+					</div>
+					<input
+						type="range"
+						min="0"
+						max="1"
+						step="0.05"
+						bind:value={anchorStrength}
+						disabled={!declutter}
+						aria-label="Layout anchor strength"
+						class="mt-1 w-full accent-accent"
+					/>
+				</div>
 
 				<!-- Search -->
 				<h2 class="mt-6 text-[18px]">Search</h2>
@@ -215,6 +298,23 @@
 					>
 						{searching ? '…' : 'Go'}
 					</button>
+				</div>
+
+				<!-- Top-k: how many nearest chunks to ring on the map. -->
+				<div class="mt-3">
+					<div class="flex items-center justify-between text-[13px] text-paper/60">
+						<span>matches</span>
+						<span class="text-paper">{topK}</span>
+					</div>
+					<input
+						type="range"
+						min="1"
+						max="25"
+						step="1"
+						bind:value={topK}
+						aria-label="Number of search matches to highlight"
+						class="mt-1 w-full accent-accent"
+					/>
 				</div>
 
 				{#if searchActive}

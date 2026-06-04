@@ -3,6 +3,7 @@
 	import Modal from '$lib/components/ui/Modal.svelte';
 	import Button from '$lib/components/ui/Button.svelte';
 	import Spinner from '$lib/components/ui/Spinner.svelte';
+	import SettingsFields from './SettingsFields.svelte';
 
 	/**
 	 * Chat Settings modal — schema-driven form over the user's preferences
@@ -14,6 +15,13 @@
 
 	/** @type {import('$lib/api/settings.js').SettingsPayload | null} */
 	let payload = $state(null);
+	// This modal only edits chat-group settings; projection knobs live on the map
+	// page and appearance (accent colour) lives on the profile page.
+	const chatSchema = $derived(
+		/** @type {import('$lib/api/settings.js').SettingsPayload | null} */ (payload)?.schema.filter(
+			(f) => f.group === 'chat'
+		) ?? []
+	);
 	/** @type {Record<string, any>} */
 	let values = $state({});
 	let loading = $state(true);
@@ -40,9 +48,10 @@
 		saving = true;
 		error = null;
 		// Only send fields that differ from the effective values (a small patch).
+		// Projection-group settings are managed on the projection page, not here.
 		/** @type {Record<string, any>} */
 		const patch = {};
-		for (const f of payload.schema) {
+		for (const f of chatSchema) {
 			if (values[f.key] !== payload.effective[f.key]) patch[f.key] = values[f.key];
 		}
 		try {
@@ -63,30 +72,7 @@
 		<Spinner label="loading…" />
 	{:else if payload}
 		<div class="flex flex-col gap-4">
-			{#each payload.schema as f (f.key)}
-				<label class="flex flex-col gap-1">
-					<span class="text-sm text-paper">{f.key}</span>
-					<span class="text-xs text-paper/50">{f.description}</span>
-					{#if f.choices}
-						<select bind:value={values[f.key]} class="border border-paper bg-ink px-2 py-1">
-							{#each f.choices as c}<option value={c}>{c}</option>{/each}
-						</select>
-					{:else if f.key === 'system_prompt'}
-						<textarea bind:value={values[f.key]} rows="5" class="border border-paper bg-ink px-2 py-1 text-sm"></textarea>
-					{:else if f.type === 'int' || f.type === 'float'}
-						<input
-							type="number"
-							bind:value={values[f.key]}
-							min={f.min ?? undefined}
-							max={f.max ?? undefined}
-							step={f.type === 'float' ? '0.1' : '1'}
-							class="border border-paper bg-ink px-2 py-1"
-						/>
-					{:else}
-						<input type="text" bind:value={values[f.key]} class="border border-paper bg-ink px-2 py-1" />
-					{/if}
-				</label>
-			{/each}
+			<SettingsFields schema={chatSchema} {values} />
 			{#if error}<p class="text-sm text-red-400">{error}</p>{/if}
 			<div class="flex justify-end gap-2">
 				<Button variant="outline" onclick={onClose}>Cancel</Button>

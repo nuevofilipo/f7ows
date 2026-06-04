@@ -14,6 +14,7 @@ from uuid import UUID
 
 from arq.connections import RedisSettings
 
+from app import apikey
 from app.chunk.chunk import chunk as chunk_markdown
 from app.config import settings
 from app.db import acquire, create_pool, close_pool
@@ -78,7 +79,14 @@ async def ingest_document(ctx: dict, document_id: str) -> dict:
     try:
         async with acquire() as conn:
             doc = await conn.fetchrow(
-                "SELECT name, storage_key, project_id FROM documents WHERE id = $1", doc_id
+                """
+                SELECT d.name, d.storage_key, d.project_id, u.openrouter_key
+                FROM documents d
+                JOIN projects p ON p.id = d.project_id
+                JOIN users u ON u.id = p.user_id
+                WHERE d.id = $1
+                """,
+                doc_id,
             )
         if doc is None:
             raise ValueError(f"document {doc_id} not found")
@@ -102,7 +110,8 @@ async def ingest_document(ctx: dict, document_id: str) -> dict:
             tr.set(chunks=len(chunks))
 
             await _set_status(doc_id, "embedding", chunks=len(chunks))
-            with tr.timer("embed"):
+            # Embed with the document owner's BYOK key (falls back to the global key).
+            with tr.timer("embed"), apikey.using_encrypted(doc["openrouter_key"]):
                 embeddings = await embed([c.content_full for c in chunks])
             tr.write("02_embedded.md", _render_embeddings(chunks, embeddings))
 

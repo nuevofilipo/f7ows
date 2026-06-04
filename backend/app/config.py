@@ -47,6 +47,11 @@ class Settings:
     jwt_secret_key: str
     jwt_algorithm: str
     jwt_expiry_minutes: int
+    # Fernet key for encrypting per-user secrets (BYOK OpenRouter keys) at rest.
+    # A urlsafe-base64 32-byte key (`Fernet.generate_key()`); kept in env, never in
+    # the DB, so a database leak alone can't decrypt stored keys. Optional: when
+    # unset, users simply can't store a personal key (the global key is still used).
+    fernet_key: str | None
     # Cookie — flip cookie_secure=True in production
     cookie_secure: bool
     cookie_samesite: str
@@ -73,6 +78,7 @@ settings = Settings(
     jwt_secret_key=_required("JWT_SECRET_KEY"),
     jwt_algorithm=os.getenv("JWT_ALGORITHM", "HS256"),
     jwt_expiry_minutes=int(os.getenv("JWT_EXPIRY_MINUTES", str(60 * 24 * 7))),  # 7 days
+    fernet_key=os.getenv("FERNET_KEY") or None,
     cookie_secure=_bool("COOKIE_SECURE", False),
     cookie_samesite=os.getenv("COOKIE_SAMESITE", "lax"),
     cookie_domain=os.getenv("COOKIE_DOMAIN") or None,

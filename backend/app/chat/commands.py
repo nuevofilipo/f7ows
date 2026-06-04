@@ -32,6 +32,10 @@ class Command:
     # query, so this never pollutes the generated text.
     retrieval_keyword: str | None = None
     parse: Callable[[str], dict] | None = None  # answer text -> structured metadata
+    # Active-recall commands (mock exam, later voice recall) exercise memory, so the
+    # chunks they cite are marked "actively_studied"; everything else is passive
+    # review ("passively_studied"). See app.chat.study.
+    active_recall: bool = False
     # Background commands (e.g. deepsummary) are multi-pass: send_message inserts a
     # placeholder assistant message and spawns ``runner`` instead of replying inline.
     background: bool = False
@@ -76,6 +80,7 @@ COMMANDS: dict[str, Command] = {
         # the keyword just guarantees we don't treat it as a precise lookup.
         retrieval_keyword="mockexam",
         parse=_parse_mockexam,
+        active_recall=True,  # a mock exam exercises memory -> actively_studied
     ),
     "deepsummary": Command(
         name="deepsummary",

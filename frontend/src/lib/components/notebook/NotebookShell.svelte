@@ -1,6 +1,7 @@
 <script>
   import { goto } from "$app/navigation";
   import { session } from "$lib/stores/session.svelte.js";
+  import { listProjects } from "$lib/api/projects.js";
   import SourcesPanel from "./SourcesPanel.svelte";
   import ChatPanel from "./ChatPanel.svelte";
   import OutputsPanel from "./OutputsPanel.svelte";
@@ -23,12 +24,61 @@
 
   let settingsOpen = $state(false);
   let profileOpen = $state(false);
+  let projectsOpen = $state(false);
 
-  // Resizable side panels (px). Clamped so the chat always keeps room.
-  let sourcesWidth = $state(340);
-  let outputsWidth = $state(356);
+  /** All of the user's notebooks, for the title dropdown. @type {import('$lib/api/projects.js').Project[]} */
+  let projects = $state([]);
+  // The other notebooks (everything but the one we're looking at).
+  const otherProjects = $derived(projects.filter((p) => p.id !== projectId));
+
+  $effect(() => {
+    if (!session.authenticated) return;
+    listProjects()
+      .then((list) => (projects = list))
+      .catch(() => {});
+  });
+
+  /** @param {string} id */
+  function switchProject(id) {
+    projectsOpen = false;
+    if (id !== projectId) goto(`/projects/${id}`);
+  }
+
+  // The two header dropdowns. A window click outside either one closes it. The
+  // toggle buttons live inside these wrappers, so a click on a button bubbles up
+  // already "inside" and never triggers a close-then-reopen.
+  /** @type {HTMLElement | undefined} */
+  let projectsMenu = $state();
+  /** @type {HTMLElement | undefined} */
+  let profileMenu = $state();
+
+  /** @param {MouseEvent} e */
+  function onWindowClick(e) {
+    const t = /** @type {Node} */ (e.target);
+    if (projectsOpen && projectsMenu && !projectsMenu.contains(t)) projectsOpen = false;
+    if (profileOpen && profileMenu && !profileMenu.contains(t)) profileOpen = false;
+  }
+
+  // Resizable side panels (px). Clamped so the chat always keeps room. The last
+  // widths are remembered in localStorage so the layout survives reloads.
+  const LAYOUT_KEY = "notebook:layout";
+  const savedLayout = (() => {
+    if (typeof localStorage === "undefined") return {};
+    try {
+      return JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? "{}");
+    } catch {
+      return {};
+    }
+  })();
+  let sourcesWidth = $state(savedLayout.sourcesWidth ?? 340);
+  let outputsWidth = $state(savedLayout.outputsWidth ?? 356);
   const MIN = 220;
   const MAX = 560;
+
+  // Persist the layout whenever a seam is dragged (effects run in the browser only).
+  $effect(() => {
+    localStorage.setItem(LAYOUT_KEY, JSON.stringify({ sourcesWidth, outputsWidth }));
+  });
 
   /**
    * Drag a seam to resize the adjacent side panel. Pointer capture keeps the
@@ -66,17 +116,52 @@
   }
 </script>
 
+<svelte:window onclick={onWindowClick} />
+
 <div class="flex h-screen flex-col bg-ink p-2 pt-0">
   <!-- Top bar -->
   <header class="flex items-center justify-between py-0">
-    <h1 class="text-[20px]">{projectName}</h1>
+    <div class="relative" bind:this={projectsMenu}>
+      <button
+        class="flex items-center gap-2 text-[20px] hover:text-accent"
+        onclick={() => (projectsOpen = !projectsOpen)}
+        aria-haspopup="listbox"
+        aria-expanded={projectsOpen}
+      >
+        <span>{projectName}</span>
+        <!-- Clean down-triangle: the only affordance that this is a dropdown. -->
+        <svg width="10" height="6" viewBox="0 0 10 6" aria-hidden="true" class="opacity-70">
+          <path d="M0 0 L5 6 L10 0 Z" fill="currentColor" />
+        </svg>
+      </button>
+      {#if projectsOpen}
+        <div class="absolute left-0 z-50 mt-2 w-56 border border-paper bg-ink p-1 text-sm" role="listbox">
+          {#if otherProjects.length}
+            {#each otherProjects as p (p.id)}
+              <button
+                class="block w-full truncate px-3 py-1.5 text-left text-paper hover:bg-paper/10"
+                role="option"
+                aria-selected="false"
+                title={p.name}
+                onclick={() => switchProject(p.id)}
+              >
+                {p.name}
+              </button>
+            {/each}
+          {:else}
+            <p class="px-3 py-1.5 text-paper/50">No other notebooks</p>
+          {/if}
+        </div>
+      {/if}
+    </div>
     <nav class="flex items-center gap-6 text-[20px]">
       <a href={`/projects/${projectId}/projection`} class="hover:text-accent">Projection</a>
-      <div class="relative">
+      <div class="relative" bind:this={profileMenu}>
         <button onclick={() => (profileOpen = !profileOpen)}>My Profile</button>
         {#if profileOpen}
           <div class="absolute right-0 z-50 mt-2 w-56 border border-paper bg-ink p-3 text-sm">
             <p class="truncate text-paper/70">{session.user?.email}</p>
+            <a href="/profile" class="mt-2 block w-full border border-paper px-3 py-1 text-center text-paper hover:bg-paper/10">Settings</a>
             <button class="mt-2 w-full bg-accent px-3 py-1 text-paper hover:opacity-90" onclick={logout}>Log out</button>
           </div>
         {/if}

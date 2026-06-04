@@ -23,9 +23,13 @@ effect, so they stay global config, not live user settings.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, fields
 
 from app.config import settings
+
+# Accepts #rgb / #rrggbb (case-insensitive) — used to validate the theme colour.
+_HEX_COLOR_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
 
 # The default system prompt. Exposed as a setting so users can see and edit it.
 DEFAULT_SYSTEM_PROMPT = (
@@ -53,14 +57,25 @@ class Preferences:
     retrieval_k: int
     planner_max_tokens: int
     default_intent: str
+    # Projection-page knobs (the map UI). User-global, like the chat settings.
+    projection_method: str
+    projection_declutter: bool
+    projection_anchor_strength: float
+    projection_search_method: str
+    projection_search_k: int
+    # Appearance — the accent colour applied across the whole UI.
+    accent_color: str
 
 
 # Schema: one entry per Preferences field. ``default`` may be a literal or a
 # zero-arg callable (used when the default comes from env config). num fields
 # carry [min, max] clamps; str fields with ``choices`` are validated against them.
-def _spec(typ, default, *, min=None, max=None, choices=None, description=""):
+# ``group`` partitions the schema for the UI (e.g. the chat settings modal only
+# renders the "chat" group; the projection page reads the "projection" group).
+def _spec(typ, default, *, min=None, max=None, choices=None, pattern=None,
+          group="chat", description=""):
     return {"type": typ, "default": default, "min": min, "max": max,
-            "choices": choices, "description": description}
+            "choices": choices, "pattern": pattern, "group": group, "description": description}
 
 
 SCHEMA: dict[str, dict] = {
@@ -98,6 +113,24 @@ SCHEMA: dict[str, dict] = {
         description="Default retrieval intent when not set per message. 'auto' "
                     "classifies (keyword + LLM); 'inbetween' = focus on one topic "
                     "via skeleton; 'global' = whole project."),
+    "projection_method": _spec(
+        "str", "umap_2d", choices=("umap_2d", "pca", "tsne"), group="projection",
+        description="Which dimensionality reduction to plot on the map."),
+    "projection_declutter": _spec(
+        "bool", True, group="projection",
+        description="Relax overlapping points apart so circles never overlap."),
+    "projection_anchor_strength": _spec(
+        "float", 0.5, min=0.0, max=1.0, group="projection",
+        description="Declutter layout: higher keeps the original shape, lower is airier."),
+    "projection_search_method": _spec(
+        "str", "cosine", choices=("cosine", "bm25"), group="projection",
+        description="Map search mode: semantic (cosine) or keyword (BM25)."),
+    "projection_search_k": _spec(
+        "int", 5, min=1, max=25, group="projection",
+        description="How many top matches the map search highlights."),
+    "accent_color": _spec(
+        "str", "#ed4bc7", pattern=_HEX_COLOR_RE.pattern, group="appearance",
+        description="UI accent colour (hex), applied across the whole app."),
 }
 
 
@@ -111,6 +144,10 @@ def _coerce(key: str, value):
     cleaned value, or raises ValueError on a wrong type / bad choice."""
     spec = SCHEMA[key]
     typ = spec["type"]
+    if typ == "bool":
+        if not isinstance(value, bool):
+            raise ValueError(f"{key} must be a boolean")
+        return value
     if typ == "int":
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"{key} must be an integer")
@@ -123,6 +160,8 @@ def _coerce(key: str, value):
             raise ValueError(f"{key} must be a string")
         if spec["choices"] is not None and value not in spec["choices"]:
             raise ValueError(f"{key} must be one of {spec['choices']}")
+        if spec.get("pattern") is not None and not re.match(spec["pattern"], value):
+            raise ValueError(f"{key} is not in the expected format")
     if spec["min"] is not None:
         value = max(spec["min"], value)
     if spec["max"] is not None:
@@ -165,6 +204,6 @@ def describe() -> list[dict]:
     return [
         {"key": key, "type": spec["type"], "default": _default(key),
          "min": spec["min"], "max": spec["max"], "choices": list(spec["choices"]) if spec["choices"] else None,
-         "description": spec["description"]}
+         "group": spec["group"], "description": spec["description"]}
         for key, spec in SCHEMA.items()
     ]

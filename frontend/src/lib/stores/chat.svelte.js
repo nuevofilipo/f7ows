@@ -70,7 +70,10 @@ export class ChatStore {
 		const token = crypto.randomUUID();
 		const effectiveParent = parentPath ?? this.messages.at(-1)?.path ?? null;
 		const userTmpPath = effectiveParent ? `${effectiveParent}.tmp` : 'tmp';
-		const tmpUser = makeTmp(`tmp-u-${token}`, this.chatId, userTmpPath, 'user', content, { level });
+		const tmpUser = makeTmp(`tmp-u-${token}`, this.chatId, userTmpPath, 'user', content, {
+			level,
+			...(command ? { command } : {})
+		});
 		const tmpAssistant = makeTmp(`tmp-a-${token}`, this.chatId, `${userTmpPath}.tmp`, 'assistant', '', {
 			pending: true,
 			level

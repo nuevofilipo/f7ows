@@ -25,10 +25,11 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-from app import trace
+from app import cost, trace
 from app.auth import get_current_user
 from app.chat import commands
 from app.chat.generate import cited_chunks, grounded_answer
+from app.chat.study import ACTIVELY_STUDIED, PASSIVELY_STUDIED, mark_studied
 from app.db import acquire
 from app.llm import LLMError
 from app.preferences import resolve
@@ -226,6 +227,9 @@ async def send_message(
 
     # Synchronous path: retrieve + generate one grounded answer.
     system_prompt = prefs.system_prompt + (f"\n\n{command.instructions}" if command else "")
+    # Zero the cost accumulator so it captures exactly this turn's model calls
+    # (the planner inside retrieval + the answer); read back into metadata below.
+    cost.reset()
     with trace.begin_run("chat", label=command.name if command else "msg",
                          project_id=str(project_id), chat_id=str(chat_id)) as tr:
         tr.write("preferences.md", trace.render_prefs(prefs, intent=intent,
@@ -245,7 +249,7 @@ async def send_message(
         # Command-specific structured output (e.g. the parsed mock-exam questions).
         extra = command.parse(answer) if command and command.parse else {}
         metadata = {"strategy": retrieval.strategy, "retrieval_tokens": retrieval.token_count,
-                    "retrieved": retrieved, "cited": cited, "level": level,
+                    "retrieved": retrieved, "cited": cited, "level": level, "cost": cost.total(),
                     "source_ids": [str(d) for d in document_ids] if document_ids else None, **extra}
         if command:
             metadata["command"] = command.name
@@ -260,6 +264,11 @@ async def send_message(
             assistant_msg = await _insert_message(
                 conn, project_id, chat_id, assistant_path, "assistant", answer, metadata,
             )
+        # Record how the cited chunks were studied for the projection map: an
+        # active-recall command (mock exam) marks them actively_studied, plain chat
+        # passively_studied. Monotonic + best-effort (never breaks the reply).
+        study_state = ACTIVELY_STUDIED if (command and command.active_recall) else PASSIVELY_STUDIED
+        await mark_studied(project_id, [c["id"] for c in cited], study_state)
         return {"user_message": user_msg, "assistant_message": assistant_msg,
                 "cited": cited, "retrieved": retrieved, **extra}
 

@@ -1,3 +1,73 @@
+2026-06-04 — My Profile page + per-user OpenRouter key (BYOK) + accent theme
+============================================================================
+
+WHAT
+- New /profile page (frontend) reachable from the existing "My Profile" dropdown,
+  which now has a "Settings" link above "Log out" (notebook + projection top bars).
+  Restates the chat settings, adds an accent colour-theme picker (3 presets + a
+  custom hex/native picker), and a write-only OpenRouter key field. Dropped the
+  Figma's Moldable UI panel and MCP-servers section per product call.
+- BYOK: a user can store their own OpenRouter key. When set, ALL their model
+  traffic (chat, planner, embeddings — incl. ingest in the worker) uses it; else
+  the global env key. Key is stored Fernet-ENCRYPTED at rest, never returned in
+  plaintext (only a masked preview + a boolean).
+
+BACKEND
+- crypto.py (new): Fernet encrypt/decrypt/mask; lazy cipher; CryptoUnavailable if
+  FERNET_KEY unset. decrypt() never raises (None on missing/garbage/no-key).
+- config.py: optional FERNET_KEY (a generated one was appended to .env).
+- apikey.py (new): ContextVar holding the active per-user key (mirrors trace.py).
+  current_key() falls back to settings.openrouter_key. set_current_encrypted() for
+  HTTP (per-request context isolation; copied into create_task → background
+  deepsummary inherits it); using_encrypted() ctx-mgr for the worker (set+reset so
+  long-lived job task can't leak a key between jobs).
+- llm.py + embed.py: Authorization header now uses apikey.current_key().
+- auth.py: users SELECTs include openrouter_key; _user_dict carries it as
+  _openrouter_key_enc (server-internal) + openrouter_key_set (bool). New
+  public_user() strips underscore-prefixed fields; me/login/register return it so
+  the encrypted token never leaves the server. get_current_user installs the key
+  into the contextvar for the whole request.
+- worker.py ingest_document: joins documents→projects→users to fetch the owner's
+  encrypted key and wraps embed() in apikey.using_encrypted(...).
+- preferences.py: new accent_color pref (group "appearance", hex-pattern
+  validated; _spec/_coerce gained an optional `pattern`). Default #ed4bc7.
+- preferences/api.py: GET /settings now also returns openrouter_key_set +
+  masked openrouter_key_preview. New PUT /settings/openrouter-key (encrypt+store,
+  503 if no FERNET_KEY) and DELETE /settings/openrouter-key (clear).
+- alembic 0003: users.openrouter_key TEXT NULL (nullable → no data migration).
+  Applied to head.
+
+FRONTEND
+- api/settings.js: setOpenRouterKey()/clearOpenRouterKey(); SettingsPayload gains
+  key-status fields.
+- components/notebook/SettingsFields.svelte (new): the schema-driven field renderer
+  extracted from ChatSettings so the modal and the profile page share it.
+  ChatSettings now filters group==='chat' strictly (was !=='projection'), so
+  appearance/accent_color never leaks into the chat modal.
+- utils/theme.js (new): applyAccent/setAccent/initTheme — sets --color-accent on
+  the document root; mirrors to localStorage to avoid a boot flash. Root layout
+  calls initTheme(); profile page applies live on pick and persists on Save (and
+  syncs localStorage from the backend value on load).
+- routes/profile/+page.svelte (new): the page itself.
+
+WHY (key decisions)
+- ContextVar over threading a key= param: avoids touching every retrieval/planner/
+  generate signature; trace.py already proves the pattern here.
+- Encrypted-at-rest + never-returned: an API key is a secret; storing it in the
+  settings JSONB would ship it to the browser on every /me. Separating ciphertext
+  (DB) from the key (env) means a DB leak alone is useless.
+- accent_color in backend settings (not just localStorage): cross-device, single
+  source of truth like every other pref; localStorage is only an anti-flash mirror.
+
+VERIFIED
+- backend: app.main imports clean; crypto round-trip + mask + garbage→None; apikey
+  fallback; accent_color resolve/validate (bad hex rejected); routes present
+  (PUT/DELETE /settings/openrouter-key); alembic upgraded 0002→0003.
+- frontend: `npm run check` 0 errors (4 pre-existing benign warnings); svelte
+  autofixer clean on the new components.
+- NOTE: did not exercise the live HTTP set/clear-key round-trip end-to-end.
+
+
 2026-06-02 — Hover-to-peek inline source citations
 ==================================================
 
@@ -418,3 +488,178 @@ VERIFIED
 - `npm run check` 0 errors (same 4 pre-existing benign warnings); `npm run build`
   succeeds (three + three/addons bundle); svelte-autofixer clean (remaining notes
   are the legitimate $effect->imperative-three sync); backend imports OK.
+
+================================================================================
+2026-06-04 - Projection search: top-k + persisted projection settings
+================================================================================
+
+WHAT
+- Fixed map "cosine search highlights everything": the cosine branch was a pure
+  nearest-neighbour query with LIMIT 100 and no relevance floor, so any project
+  with <=100 chunks returned every chunk. Now search returns the top-k nearest
+  (default 5), bounded 1..25, applied to BOTH cosine and bm25 branches. Removed
+  the old _SEARCH_LIMIT constant. Chose top-k over a similarity threshold: it's
+  predictable/explainable and the user judges relevance from what gets ringed.
+- Added a top-k slider to the Search section of the projection settings sidebar.
+- Persisted all five projection knobs (method, declutter, anchor strength, search
+  method, search k) in user preferences so they survive reloads.
+
+WHERE
+- backend/app/projections/api.py: search_projection gains `k` Query param
+  (ge=1, le=25, default 5); used as LIMIT in cosine + bm25. Docstring notes the
+  no-floor semantics.
+- backend/app/preferences/preferences.py: added five projection_* fields to the
+  Preferences dataclass + SCHEMA (group="projection"). Added "bool" type support
+  to _coerce (declutter), and a `group` field to _spec/describe() so the schema
+  can be partitioned by UI surface. Existing chat fields default to group="chat".
+- frontend: projection.js (searchProjection takes k); settings.js typedef gains
+  `group`; ChatSettings.svelte filters schema to non-projection group + renders
+  bool as a checkbox; projection +page.svelte loads settings on mount, seeds the
+  knobs from effective.projection_*, adds the top-k slider, and debounce-saves
+  (500ms) any knob change via PUT /settings (option A, no Save button).
+
+WHY group/bool additions
+- The settings schema is shared UI: ChatSettings renders every field generically,
+  so projection knobs would leak into the chat modal without a group filter.
+- declutter is the first boolean preference; _coerce only handled int/float/str.
+
+VERIFIED
+- backend: resolve() clamps projection_search_k 50->25, accepts bool, exposes
+  both groups; validate() accepts bool. Imports OK.
+- frontend: `npm run check` 0 errors (4 pre-existing benign warnings);
+  svelte-autofixer clean on both touched components.
+
+================================================================================
+2026-06-04 - Projection map: click a point to see its chunk content
+================================================================================
+
+WHAT
+- Clicking a point on the map now opens a detail popup (bottom-right) showing that
+  chunk's full content, rendered as Markdown + KaTeX. The view pans (zoom kept) to
+  keep the clicked point clear of the popup, but only when it would actually be
+  occluded/off-screen — points already comfortably in view don't move.
+
+WHERE
+- backend/app/projections/api.py: new GET /projects/{id}/projection/chunks/{chunk_id}
+  returns {id, content_full}. Lazy by design (kept out of the map payload so a
+  project's whole corpus isn't shipped up front). Join on project_id so a chunk
+  from another project / stale id 404s.
+- frontend/src/lib/api/projection.js: getProjectionChunk(projectId, chunkId).
+- frontend ProjectionMap.svelte:
+  * gains a `projectId` prop; page passes it through.
+  * selection state + click handler (with a <5px down/up guard so the tail of a
+    pan isn't read as a click); a distinct thicker accent ring marks the open
+    point, which is also exempt from search-dimming.
+  * detail popup reuses the existing renderMarkdown() util (marked + marked-katex
+    + DOMPurify) with the global prose-chat styling; spinner while the content
+    lazy-loads, error line on failure, Escape / ✕ to close.
+  * panToClear(): conditional pan that keeps the current zoom; computes the point's
+    on-screen pos, and if it's off-screen or under the fixed worst-case popup rect,
+    eases it (rAF) into the top-left open area. Animation steps zoomBehavior.transform
+    each frame so d3-zoom's internal state stays in sync (no d3-transition dep).
+
+WHY reuse renderMarkdown rather than a new component
+- markdown.js already encapsulates the debugged markdown+KaTeX+sanitize pipeline;
+  MessageBubble's extra complexity is just its citation-hover popup, which the map
+  doesn't need. The util IS the reusable piece.
+
+VERIFIED
+- backend: api.py compiles (py_compile). Full import needs deps not installed in
+  this env (jwt), unrelated to the change.
+- frontend: `npm run check` 0 errors (4 pre-existing benign warnings);
+  svelte-autofixer clean apart from the expected {@html} note (content is
+  DOMPurify-sanitized, same accepted pattern as MessageBubble).
+
+================================================================================
+2026-06-04 - Study tracking: mark cited chunks studied for the projection map
+================================================================================
+
+WHAT
+- Chunks cited in a chat answer are now recorded on chunks.study_status, which the
+  projection map already colours by. Active-recall commands (mock exam; later voice
+  recall) mark their cited chunks "actively_studied"; plain chat and deep summaries
+  mark them "passively_studied". Un-cited chunks stay "not_studied" (default {}).
+- Renamed the state vocabulary for clarity: actively_recalled -> actively_studied,
+  summarised -> passively_studied (not_studied unchanged).
+
+WHERE
+- backend/app/chat/study.py (new): mark_studied(project_id, chunk_ids, state).
+  Single monotonic writer — only ever raises a chunk's state (active > passive >
+  none), so passive review can't overwrite an earlier active recall. Best-effort:
+  logs and returns 0 on failure, never breaks a reply. Exposes the state constants.
+- backend/app/chat/commands.py: Command gains `active_recall: bool`; mockexam=True.
+- backend/app/chat/chat.py: sync send_message path marks cited chunks after the
+  assistant message is inserted (ACTIVELY_STUDIED if command.active_recall else
+  PASSIVELY_STUDIED).
+- backend/app/chat/deepsummary.py: run() marks its cited `union` PASSIVELY_STUDIED.
+- backend/app/projections/api.py: _study_state maps the new names (keeps the old
+  names + active/passive as accepted synonyms, defensively).
+- frontend: study union type (projection.js), ProjectionMap.style() + header doc,
+  and the projection page LEGEND + legend key checks updated to the new names.
+
+WHY chat/study.py (not app-level, not chat.py)
+- A separate module in the chat package avoids a circular import (deepsummary can't
+  import chat.py, which imports deepsummary via commands). Per user preference it
+  lives under chat/ rather than app/; projections keeps its own read-side mapper.
+
+NO migration
+- chunks.study_status already exists (0001_initial_schema, JSONB default {}).
+
+VERIFIED
+- backend: py_compile on study.py, chat.py, commands.py, deepsummary.py, api.py.
+  Full import needs deps not installed here (jwt), unrelated.
+- frontend: `npm run check` 0 errors (4 pre-existing benign warnings). No old state
+  strings remain in frontend; backend only retains them as accepted synonyms.
+
+---
+
+## Model catalogue endpoint + searchable model picker (backend + frontend)
+
+WHAT
+- backend: new `GET /settings/models` (app/preferences/api.py) returning the
+  gateway's model list trimmed to `{id, name}`, sorted by name. Backed by a new
+  `llm.list_models()` (app/llm.py) — raw httpx GET to `{llm_base_url}/models`,
+  sends the BYOK/global key for context, raises LLMError on failure (mapped to 502).
+- frontend: reusable ModelSelect.svelte (searchable dropdown) used in Chat Settings
+  (replaces the free-text chat_model field) and as a compact quick-switch in the
+  ChatPanel header (persists via PUT /settings on change).
+
+WHY
+- Users had to type an exact OpenRouter model id into a text box for it to work.
+- No caching by design (user call): the list is fetched only when the dropdown is
+  first opened, never on page load — keeps it simple, no staleness to manage.
+
+VERIFIED
+- backend: ast.parse on llm.py + api.py OK (full import needs uninstalled deps).
+- frontend: `npm run check` 0 errors (4 pre-existing benign warnings).
+
+---
+
+## Per-chat dollar cost tracking (backend + frontend)
+
+WHAT
+- backend: new app/cost.py — a contextvars accumulator (mirrors app/apikey.py).
+  llm.complete() now sends `usage: {include: true}` and adds the response's
+  `usage.cost` (real USD OpenRouter charged) into the accumulator on every call.
+  chat.py resets it at the start of a turn and stores `metadata["cost"]` on the
+  assistant message (captures planner + answer). deepsummary.py resets at task
+  start and stores the pipeline total (outline + all sections).
+- frontend: ChatPanel derives `chatCost` = sum of metadata.cost across messages,
+  passed to Composer which renders it in the readout (replacing the hardcoded
+  $0.00). Sub-cent totals show 4 decimals so they don't read as $0.00.
+
+WHY
+- The cost readout was a hardcoded placeholder. OpenRouter returns true per-gen
+  cost when asked, so we capture it per response and sum per chat.
+- Accumulator (vs threading a return value) counts every model call in a turn
+  automatically, including the cheap retrieval planner, with no signature changes.
+
+NO migration — metadata is JSONB; old messages without `cost` count as 0.
+
+ALSO: ModelSelect closed-button label now strips the provider from the raw id
+(provider/model), not just the fetched "Provider: Name", so it reads cleanly
+before the list is lazily loaded on first open.
+
+VERIFIED
+- backend: ast.parse on cost.py, llm.py, chat.py, deepsummary.py OK.
+- frontend: `npm run check` 0 errors (4 pre-existing benign warnings).

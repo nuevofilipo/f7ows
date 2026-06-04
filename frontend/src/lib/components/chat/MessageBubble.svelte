@@ -18,6 +18,8 @@
 	let { message, onReply, onContinue } = $props();
 
 	const isUser = $derived(message.role === 'user');
+	// Slash-command a user turn ran (/mockexam, /deepsummary …), shown as a tag.
+	const command = $derived(message.metadata?.command);
 	const pending = $derived(isPending(message));
 	const generating = $derived(isGenerating(message));
 	const level = $derived(message.metadata?.level ?? 1);
@@ -96,7 +98,7 @@
 {#if isUser}
 	<div class="flex justify-end">
 		<div class="max-w-[70%] border border-paper px-4 py-3">
-			<p class="whitespace-pre-wrap text-[15px] leading-relaxed">{message.content}</p>
+			<p class="whitespace-pre-wrap text-[15px] leading-relaxed">{#if command}<span class="text-accent">/{command}</span>{' '}{/if}{message.content}</p>
 		</div>
 	</div>
 {:else}
@@ -105,20 +107,25 @@
 			<TypingDots />
 		{:else if generating}
 			<Spinner label="generating…" />
-		{:else if exam}
-			<MockExam {exam} />
 		{:else}
 			<div bind:this={container} class="relative">
 				<!-- svelte-ignore a11y_mouse_events_have_key_events -->
+				<!-- Citation hover is delegated from this wrapper, so [S#] markers work
+				     in both the plain answer and the MockExam (both emit .cite spans). -->
 				<div
-					class="prose-chat max-w-none text-[15px] leading-relaxed"
 					role="presentation"
 					onmouseover={onCiteEnter}
 					onmouseout={scheduleClose}
 					onfocusin={onCiteEnter}
 					onfocusout={scheduleClose}
 				>
-					{@html renderMarkdown(message.content)}
+					{#if exam}
+						<MockExam {exam} />
+					{:else}
+						<div class="prose-chat max-w-none text-[15px] leading-relaxed">
+							{@html renderMarkdown(message.content)}
+						</div>
+					{/if}
 				</div>
 				{#if popup}
 					<div
@@ -132,7 +139,7 @@
 						<div class="mb-1 break-all border-b border-paper pb-1 text-xs text-paper/50">
 							{popup.entry.path}
 						</div>
-						<div class="whitespace-pre-wrap text-[13px] leading-relaxed text-paper/80">
+						<div class="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-paper/80">
 							{popup.entry.text}
 						</div>
 					</div>

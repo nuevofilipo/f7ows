@@ -28,6 +28,7 @@ if __package__ in (None, ""):
 
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
+from app import apikey
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -72,7 +73,7 @@ def _truncate(text: str) -> str:
 async def _embed_batch(client: httpx.AsyncClient, batch: list[str]) -> list[list[float]]:
     """POST one batch, with retry/backoff, and return vectors in input order."""
     payload = {"model": settings.embed_model, "input": batch, "dimensions": EMBED_DIM}
-    headers = {"Authorization": f"Bearer {settings.openrouter_key}"}
+    headers = {"Authorization": f"Bearer {apikey.current_key()}"}
     url = f"{settings.embed_base_url.rstrip('/')}/embeddings"
 
     for attempt in range(1, _MAX_RETRIES + 1):

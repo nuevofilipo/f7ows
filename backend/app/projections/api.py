@@ -30,10 +30,6 @@ from app.embed import embed
 
 router = APIRouter(prefix="/projects/{project_id}/projection", tags=["projection"])
 
-# How many chunks a single search request may flag. Generous — the map just rings
-# them — but bounded so a one-word query can't return the whole corpus.
-_SEARCH_LIMIT = 100
-
 
 async def _owned_project(project_id: UUID, user_id) -> None:
     """404 unless the project exists and belongs to the current user."""
@@ -61,20 +57,19 @@ def _json(value):
 
 def _study_state(study_status) -> str:
     """Collapse a chunk's ``study_status`` JSONB into one of the three legend
-    buckets the map colours by. Nothing writes ``study_status`` yet (it defaults
-    to ``{}``), so everything is "not_studied" for now — but the convention is
-    fixed here so the marking code added later just has to match it:
+    buckets the map colours by. The states are written by ``app.chat.study`` when
+    a chunk is cited; an un-cited chunk keeps the default ``{}`` -> "not_studied":
 
-        {"state": "actively_recalled"}  -> filled accent  (quiz / mock exam)
-        {"state": "summarised"}         -> accent outline  (passive: summary/chat)
+        {"state": "actively_studied"}   -> filled accent  (active recall: mock exam)
+        {"state": "passively_studied"}  -> accent outline  (passive: summary/chat)
         anything else / {}              -> "not_studied"   (paper outline)
     """
     blob = _json(study_status) or {}
     state = str(blob.get("state", "")).lower()
-    if state in ("actively_recalled", "active"):
-        return "actively_recalled"
-    if state in ("summarised", "summarized", "passive"):
-        return "summarised"
+    if state in ("actively_studied", "actively_recalled", "active"):
+        return "actively_studied"
+    if state in ("passively_studied", "summarised", "summarized", "passive"):
+        return "passively_studied"
     return "not_studied"
 
 
@@ -125,14 +120,47 @@ async def get_projection(
     return {"ready": ready, "chunks": chunks}
 
 
+@router.get("/chunks/{chunk_id}")
+async def get_chunk_content(
+    project_id: UUID,
+    chunk_id: UUID,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """The full Markdown text of one chunk, fetched lazily when a point is clicked.
+
+    Kept out of ``get_projection`` on purpose — the map payload carries only the
+    metadata needed to plot/label points, so a project's entire corpus isn't
+    shipped up front. The join on ``project_id`` ensures a chunk from another
+    project (or a stale id) 404s rather than leaking content across projects.
+    """
+    await _owned_project(project_id, current_user["id"])
+    async with acquire() as conn:
+        content = await conn.fetchval(
+            """
+            SELECT c.content_full
+            FROM chunks c JOIN documents d ON d.id = c.document_id
+            WHERE c.id = $1 AND d.project_id = $2
+            """,
+            chunk_id, project_id,
+        )
+    if content is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Chunk not found")
+    return {"id": str(chunk_id), "content_full": content}
+
+
 @router.get("/search")
 async def search_projection(
     project_id: UUID,
     q: str = Query(..., min_length=1, description="search term"),
     method: str = Query("cosine", pattern="^(cosine|bm25)$"),
+    k: int = Query(5, ge=1, le=25, description="how many top matches to return"),
     current_user: dict = Depends(get_current_user),
 ) -> dict:
-    """Rank the project's chunks against ``q`` and return ids + scores to highlight.
+    """Rank the project's chunks against ``q`` and return the top ``k`` ids + scores.
+
+    The map rings exactly these top-``k`` nearest chunks — there is no relevance
+    floor, so the user judges relevance from what gets ringed (an empty/unrelated
+    project simply highlights its closest, possibly-irrelevant, chunks).
 
     * ``cosine`` — embed the query and order by pgvector cosine distance over the
       dense embedding (semantic match). Score is similarity in [0, 1].
@@ -152,7 +180,7 @@ async def search_projection(
                 ORDER BY c.embedding <=> $2::halfvec
                 LIMIT $3
                 """,
-                project_id, vector, _SEARCH_LIMIT,
+                project_id, vector, k,
             )
     else:  # bm25 — keyword full-text ranking
         async with acquire() as conn:
@@ -168,7 +196,7 @@ async def search_projection(
                 ORDER BY score DESC
                 LIMIT $3
                 """,
-                project_id, q, _SEARCH_LIMIT,
+                project_id, q, k,
             )
 
     return {

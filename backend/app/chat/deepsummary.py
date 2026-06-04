@@ -19,8 +19,9 @@ import asyncio
 import json
 import logging
 
-from app import trace
+from app import cost, trace
 from app.chat.generate import cited_chunks, grounded_answer
+from app.chat.study import PASSIVELY_STUDIED, mark_studied
 from app.config import settings
 from app.db import acquire
 from app.preferences import Preferences
@@ -83,6 +84,9 @@ async def _set_result(message_id, content: str, metadata: dict) -> None:
 async def run(project_id, topic: str, prefs: Preferences, message_id, document_ids=None) -> None:
     """Run the pipeline and write the result into the placeholder message."""
     logger.info("deepsummary: starting %s for topic %r", message_id, topic)
+    # This task runs in its own copied context; zero the accumulator so it sums
+    # only this pipeline's calls (outline + every section).
+    cost.reset()
     try:
         with trace.begin_run("deepsummary", label=topic,
                              project_id=str(project_id), message_id=str(message_id)) as tr:
@@ -110,7 +114,10 @@ async def run(project_id, topic: str, prefs: Preferences, message_id, document_i
             await _set_result(message_id, document, {
                 "state": "ready", "command": "deepsummary", "topic": topic,
                 "outline": outline, "sections": sections_meta, "cited": union,
+                "cost": cost.total(),
             })
+            # A deep summary is passive review -> mark every cited chunk studied.
+            await mark_studied(project_id, [c["id"] for c in union], PASSIVELY_STUDIED)
             logger.info("deepsummary: %s ready (%d sections)", message_id, len(outline))
     except Exception as exc:  # noqa: BLE001 - record on the message, never crash the loop
         logger.exception("deepsummary failed: %s", message_id)

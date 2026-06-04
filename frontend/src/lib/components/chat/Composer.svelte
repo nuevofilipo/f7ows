@@ -9,6 +9,7 @@
 	 *   canSend?: boolean,
 	 *   actionTarget?: { message: import('$lib/api/chats.js').Message, mode: 'reply' | 'continue' } | null,
 	 *   lastTokens?: number | null,
+	 *   chatCost?: number,
 	 *   onSend: (p: { content: string, command?: string }) => void,
 	 *   onCancelAction?: () => void
 	 * }}
@@ -19,9 +20,16 @@
 		canSend = true,
 		actionTarget = null,
 		lastTokens = null,
+		chatCost = 0,
 		onSend,
 		onCancelAction
 	} = $props();
+
+	// Format the running chat cost: more precision below a cent so sub-cent chats
+	// still read as a real number rather than "$0.00".
+	const costLabel = $derived(
+		!chatCost ? '$0.00' : chatCost < 0.01 ? `$${chatCost.toFixed(4)}` : `$${chatCost.toFixed(3)}`
+	);
 
 	let text = $state('');
 	/** @type {string | null} */
@@ -140,9 +148,9 @@
 			>
 				{sending ? '…' : 'Send'}
 			</button>
-			{#if lastTokens != null}
-				<span class="text-xs text-paper/60">{lastTokens.toLocaleString()} ctx/$0.00</span>
-			{/if}
+			<span class="text-xs text-paper/60">
+				{#if lastTokens != null}{lastTokens.toLocaleString()} ctx · {/if}{costLabel}
+			</span>
 		</div>
 	</div>
 

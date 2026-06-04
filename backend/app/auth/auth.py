@@ -19,6 +19,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
+from app import apikey
 from app.config import settings
 from app.db import acquire
 
@@ -26,7 +27,12 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def _user_dict(row) -> dict:
-    """Shape a users row into the public response (never includes the password hash).
+    """Shape a users row into the internal current-user dict.
+
+    Never includes the password hash. The user's OpenRouter key is kept encrypted
+    under the underscore-prefixed ``_openrouter_key_enc`` (server-internal, stripped
+    before any response by :func:`public_user`); ``openrouter_key_set`` is the
+    non-secret boolean the frontend can show.
 
     asyncpg returns jsonb as a JSON string (no codec registered), so parse the
     settings blob back into a dict for callers (preferences resolution etc.).
@@ -37,12 +43,20 @@ def _user_dict(row) -> dict:
             settings_value = json.loads(settings_value)
         except (ValueError, TypeError):
             settings_value = {}
+    enc = row["openrouter_key"] if "openrouter_key" in row else None
     return {
         "id": row["id"],
         "email": row["email"],
         "settings": settings_value if isinstance(settings_value, dict) else {},
         "created_at": row["created_at"],
+        "_openrouter_key_enc": enc,
+        "openrouter_key_set": bool(enc),
     }
+
+
+def public_user(user: dict) -> dict:
+    """Strip server-internal fields (encrypted secrets) before returning to a client."""
+    return {k: v for k, v in user.items() if not k.startswith("_")}
 
 
 async def _read_credentials(request: Request, *, min_password: int) -> tuple[str, str]:
@@ -136,12 +150,16 @@ async def get_current_user(request: Request) -> dict:
 
     async with acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, email, settings, created_at FROM users WHERE id = $1",
+            "SELECT id, email, settings, openrouter_key, created_at FROM users WHERE id = $1",
             user_id,
         )
     if row is None:
         raise _UNAUTHORIZED
-    return _user_dict(row)
+    user = _user_dict(row)
+    # Install this user's BYOK key for the whole request (and any task it spawns),
+    # so every model call uses their key; falls back to the global key if unset.
+    apikey.set_current_encrypted(user["_openrouter_key_enc"])
+    return user
 
 
 # OUTWARD POINTING ENDPOINTS STARTING FROM HERE:
@@ -159,7 +177,7 @@ async def register(request: Request, response: Response) -> dict:
             INSERT INTO users (email, hashed_password)
             VALUES ($1, $2)
             ON CONFLICT (email) DO NOTHING
-            RETURNING id, email, settings, created_at
+            RETURNING id, email, settings, openrouter_key, created_at
             """,
             email,
             hash_password(password),
@@ -168,7 +186,7 @@ async def register(request: Request, response: Response) -> dict:
         raise HTTPException(status.HTTP_409_CONFLICT, "Email is already registered")
 
     _set_auth_cookie(response, create_access_token(row["id"]))
-    return _user_dict(row)
+    return public_user(_user_dict(row))
 
 
 @router.post("/login")
@@ -176,7 +194,8 @@ async def login(request: Request, response: Response) -> dict:
     email, password = await _read_credentials(request, min_password=1)
     async with acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, email, hashed_password, settings, created_at FROM users WHERE email = $1",
+            "SELECT id, email, hashed_password, settings, openrouter_key, created_at "
+            "FROM users WHERE email = $1",
             email,
         )
     # Run verify even when the user is missing (against a dummy hash) so the
@@ -187,7 +206,7 @@ async def login(request: Request, response: Response) -> dict:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid email or password")
 
     _set_auth_cookie(response, create_access_token(row["id"]))
-    return _user_dict(row)
+    return public_user(_user_dict(row))
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
@@ -197,4 +216,4 @@ async def logout(response: Response) -> None:
 
 @router.get("/me")
 async def me(current_user: dict = Depends(get_current_user)) -> dict:
-    return current_user
+    return public_user(current_user)
