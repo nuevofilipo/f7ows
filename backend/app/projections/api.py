@@ -25,6 +25,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.auth import get_current_user
+from app.chat.study import clear_studied
 from app.db import acquire
 from app.embed import embed
 
@@ -118,6 +119,22 @@ async def get_projection(
             "coords": {"umap_2d": umap_2d, "pca": pca, "tsne": tsne},
         })
     return {"ready": ready, "chunks": chunks}
+
+
+@router.post("/reset")
+async def reset_study_progress(
+    project_id: UUID,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """Reset every chunk's study state back to ``not_studied`` for this project.
+
+    A manual "start over" for the map: clears all actively/passively studied marks
+    in one shot (see :func:`app.chat.study.clear_studied`). Returns how many chunks
+    were actually cleared so the UI can report it.
+    """
+    await _owned_project(project_id, current_user["id"])
+    cleared = await clear_studied(project_id)
+    return {"cleared": cleared}
 
 
 @router.get("/chunks/{chunk_id}")

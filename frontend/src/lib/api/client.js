@@ -65,6 +65,8 @@ export const api = {
 	post: (/** @type {string} */ p, /** @type {unknown} */ body = undefined) =>
 		request(p, body === undefined ? { method: 'POST' } : { method: 'POST', body }),
 	put: (/** @type {string} */ p, /** @type {unknown} */ body) => request(p, { method: 'PUT', body }),
+	patch: (/** @type {string} */ p, /** @type {unknown} */ body) => request(p, { method: 'PATCH', body }),
+	delete: (/** @type {string} */ p) => request(p, { method: 'DELETE' }),
 	/** @param {string} p @param {BodyInit} raw */
 	postRaw: (p, raw) => request(p, { method: 'POST', raw })
 };

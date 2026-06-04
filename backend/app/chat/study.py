@@ -73,3 +73,26 @@ async def mark_studied(project_id, chunk_ids, state: str) -> int:
     except Exception:  # noqa: BLE001 - never let study tracking break a reply
         logger.warning("mark_studied failed for project %s", project_id, exc_info=True)
         return 0
+
+
+async def clear_studied(project_id) -> int:
+    """Reset every chunk in ``project_id`` back to ``not_studied``.
+
+    The deliberate inverse of :func:`mark_studied`'s monotonic upgrade — a manual
+    "start over" for the projection map, clearing all active *and* passive states
+    in one shot. Writes the default ``{}`` (which reads back as ``not_studied``)
+    rather than a ``{"state": ...}`` blob. Returns the number of chunks cleared.
+    """
+    async with acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE chunks c
+            SET study_status = '{}'::jsonb
+            FROM documents d
+            WHERE c.document_id = d.id
+              AND d.project_id = $1
+              AND c.study_status <> '{}'::jsonb
+            """,
+            project_id,
+        )
+    return int(result.split()[-1]) if result else 0

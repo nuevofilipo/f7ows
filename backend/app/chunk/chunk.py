@@ -39,8 +39,8 @@ logger = logging.getLogger(__name__)
 # bigger than MAX (a long equation, say) is allowed to overflow rather than split.
 
 # resized to make it more granular
-MIN_TOKENS = 200
-MAX_TOKENS = 500
+MIN_TOKENS = 400
+MAX_TOKENS = 800
 
 # Max characters for one ltree label — keeps paths readable and well under
 # Postgres' 256-byte label limit.

@@ -1,7 +1,7 @@
 <script>
   import { goto } from "$app/navigation";
   import { session } from "$lib/stores/session.svelte.js";
-  import { listProjects } from "$lib/api/projects.js";
+  import { listProjects, createProject } from "$lib/api/projects.js";
   import SourcesPanel from "./SourcesPanel.svelte";
   import ChatPanel from "./ChatPanel.svelte";
   import OutputsPanel from "./OutputsPanel.svelte";
@@ -42,6 +42,37 @@
   function switchProject(id) {
     projectsOpen = false;
     if (id !== projectId) goto(`/projects/${id}`);
+  }
+
+  // Inline "new notebook" creator next to the title — a subtle "+" reveals an
+  // input + Create button, so a notebook can be made without the list page.
+  let creatingOpen = $state(false);
+  let newName = $state("");
+  let creating = $state(false);
+  /** @type {HTMLInputElement | undefined} */
+  let newNameInput = $state();
+
+  function openCreate() {
+    creatingOpen = true;
+    // Focus the field once it's in the DOM.
+    queueMicrotask(() => newNameInput?.focus());
+  }
+
+  function cancelCreate() {
+    creatingOpen = false;
+    newName = "";
+  }
+
+  async function create() {
+    const name = newName.trim();
+    if (!name || creating) return;
+    creating = true;
+    try {
+      const project = await createProject(name);
+      goto(`/projects/${project.id}`);
+    } catch {
+      creating = false; // surfaced by staying open; keep it simple for now
+    }
   }
 
   // The two header dropdowns. A window click outside either one closes it. The
@@ -121,39 +152,78 @@
 <div class="flex h-screen flex-col bg-ink p-2 pt-0">
   <!-- Top bar -->
   <header class="flex items-center justify-between py-0">
-    <div class="relative" bind:this={projectsMenu}>
+    <div class="flex items-center gap-3">
+      <div class="relative" bind:this={projectsMenu}>
+        <button
+          class="flex items-center gap-2 text-[20px] hover:text-accent"
+          onclick={() => (projectsOpen = !projectsOpen)}
+          aria-haspopup="listbox"
+          aria-expanded={projectsOpen}
+        >
+          <span>{projectName}</span>
+          <!-- Clean down-triangle: the only affordance that this is a dropdown. -->
+          <svg width="10" height="6" viewBox="0 0 10 6" aria-hidden="true" class="opacity-70">
+            <path d="M0 0 L5 6 L10 0 Z" fill="currentColor" />
+          </svg>
+        </button>
+        {#if projectsOpen}
+          <div class="absolute left-0 z-50 mt-2 w-56 border border-paper bg-ink p-1 text-sm" role="listbox">
+            {#if otherProjects.length}
+              {#each otherProjects as p (p.id)}
+                <button
+                  class="block w-full truncate px-3 py-1.5 text-left text-paper hover:bg-paper/10"
+                  role="option"
+                  aria-selected="false"
+                  title={p.name}
+                  onclick={() => switchProject(p.id)}
+                >
+                  {p.name}
+                </button>
+              {/each}
+            {:else}
+              <p class="px-3 py-1.5 text-paper/50">No other notebooks</p>
+            {/if}
+          </div>
+        {/if}
+      </div>
+
+      <!-- Inline new-notebook creator: a subtle "+" toggles open into a "−"; the name
+         field + Create appear to its right. Clicking the "−" closes it again. -->
       <button
-        class="flex items-center gap-2 text-[20px] hover:text-accent"
-        onclick={() => (projectsOpen = !projectsOpen)}
-        aria-haspopup="listbox"
-        aria-expanded={projectsOpen}
+        class="text-2xl leading-none text-paper/50 hover:text-accent"
+        onclick={() => (creatingOpen ? cancelCreate() : openCreate())}
+        aria-label={creatingOpen ? "Cancel new notebook" : "New notebook"}
+        aria-expanded={creatingOpen}
+        title={creatingOpen ? "Cancel" : "New notebook"}
       >
-        <span>{projectName}</span>
-        <!-- Clean down-triangle: the only affordance that this is a dropdown. -->
-        <svg width="10" height="6" viewBox="0 0 10 6" aria-hidden="true" class="opacity-70">
-          <path d="M0 0 L5 6 L10 0 Z" fill="currentColor" />
-        </svg>
+        {creatingOpen ? "−" : "+"}
       </button>
-      {#if projectsOpen}
-        <div class="absolute left-0 z-50 mt-2 w-56 border border-paper bg-ink p-1 text-sm" role="listbox">
-          {#if otherProjects.length}
-            {#each otherProjects as p (p.id)}
-              <button
-                class="block w-full truncate px-3 py-1.5 text-left text-paper hover:bg-paper/10"
-                role="option"
-                aria-selected="false"
-                title={p.name}
-                onclick={() => switchProject(p.id)}
-              >
-                {p.name}
-              </button>
-            {/each}
-          {:else}
-            <p class="px-3 py-1.5 text-paper/50">No other notebooks</p>
-          {/if}
-        </div>
+      {#if creatingOpen}
+        <form
+          class="flex items-center gap-2"
+          onsubmit={(e) => {
+            e.preventDefault();
+            create();
+          }}
+        >
+          <input
+            bind:this={newNameInput}
+            bind:value={newName}
+            placeholder="Enter project name"
+            class=" bg-ink px-2 py-1 text-sm focus:outline-none"
+            onkeydown={(e) => e.key === "Escape" && cancelCreate()}
+          />
+          <button
+            type="submit"
+            class="bg-accent px-3 py-1 text-sm text-paper hover:opacity-90 disabled:opacity-40"
+            disabled={creating || !newName.trim()}
+          >
+            {creating ? "Creating…" : "Create"}
+          </button>
+        </form>
       {/if}
     </div>
+
     <nav class="flex items-center gap-6 text-[20px]">
       <a href={`/projects/${projectId}/projection`} class="hover:text-accent">Projection</a>
       <div class="relative" bind:this={profileMenu}>

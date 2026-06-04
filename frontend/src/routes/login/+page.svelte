@@ -42,7 +42,7 @@
       submit();
     }}
   >
-    <h1 class="mb-2 text-[26px]">{mode === "login" ? "Login" : "Signup"}</h1>
+    <h1 class="mb-0 text-[26px]">{mode === "login" ? "Login" : "Signup"}</h1>
 
     <label class="flex flex-col gap-1">
       <!-- <span class="text-[15px]">email</span> -->
@@ -52,7 +52,7 @@
         required
         autocomplete="email"
         placeholder="email"
-        class="border border-paper bg-ink px-3 py-2 text-[16px] focus:outline-none"
+        class="border border-paper bg-ink px-3 py-2 text-[18px] focus:outline-none"
       />
     </label>
 
@@ -64,7 +64,7 @@
         required
         placeholder="password"
         autocomplete={mode === "login" ? "current-password" : "new-password"}
-        class="border border-paper bg-ink px-3 py-2 text-[16px] focus:outline-none"
+        class="border border-paper bg-ink px-3 py-2 text-[18px] focus:outline-none"
       />
     </label>
 

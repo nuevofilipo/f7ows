@@ -2,14 +2,15 @@
 	import { goto } from '$app/navigation';
 	import { listProjects, createProject } from '$lib/api/projects.js';
 	import { session } from '$lib/stores/session.svelte.js';
-	import Button from '$lib/components/ui/Button.svelte';
 	import Spinner from '$lib/components/ui/Spinner.svelte';
 
-	/** @type {import('$lib/api/projects.js').Project[]} */
-	let projects = $state([]);
-	let loading = $state(true);
-	let creating = $state(false);
-	let newName = $state('');
+	/** localStorage key for the most recently opened project (written by the notebook page). */
+	const LAST_PROJECT_KEY = 'notebook:lastProject';
+
+	// There is no notebook list anymore: the base domain just drops you into a
+	// project. Prefer the most recently used one (remembered in localStorage),
+	// else the newest. A brand-new user with zero projects gets one created in the
+	// background and lands in it behind a forced onboarding modal (?onboarding=1).
 	/** @type {string|null} */
 	let error = $state(null);
 
@@ -17,72 +18,31 @@
 		if (!session.authenticated) return;
 		(async () => {
 			try {
-				projects = await listProjects();
+				const projects = await listProjects();
+				if (projects.length === 0) {
+					const project = await createProject('Untitled notebook');
+					goto(`/projects/${project.id}?onboarding=1`, { replaceState: true });
+					return;
+				}
+				// Reopen the last-used project if it still exists, else the newest
+				// (listProjects returns created_at DESC, so [0] is newest).
+				const remembered = localStorage.getItem(LAST_PROJECT_KEY);
+				const exists = remembered && projects.some((p) => p.id === remembered);
+				const target = (exists && remembered) || projects[0].id;
+				goto(`/projects/${target}`, { replaceState: true });
 			} catch (/** @type {any} */ err) {
-				error = err?.message ?? 'Failed to load notebooks';
-			} finally {
-				loading = false;
+				error = err?.message ?? 'Failed to open your notebook';
 			}
 		})();
 	});
-
-	async function create() {
-		const name = newName.trim();
-		if (!name || creating) return;
-		creating = true;
-		error = null;
-		try {
-			const project = await createProject(name);
-			goto(`/projects/${project.id}`);
-		} catch (/** @type {any} */ err) {
-			error = err?.message ?? 'Failed to create notebook';
-			creating = false;
-		}
-	}
 </script>
 
-<div class="mx-auto max-w-2xl px-6 py-12">
-	<div class="mb-8 flex items-baseline justify-between">
-		<h1 class="text-[32px]">Your notebooks</h1>
-		<span class="text-sm text-paper/50">{session.user?.email}</span>
+{#if error}
+	<div class="flex h-screen items-center justify-center px-6">
+		<p class="text-sm text-red-400">{error}</p>
 	</div>
-
-	<form
-		class="mb-8 flex gap-2"
-		onsubmit={(e) => {
-			e.preventDefault();
-			create();
-		}}
-	>
-		<input
-			bind:value={newName}
-			placeholder="New notebook name…"
-			class="flex-1 border border-paper bg-ink px-3 py-2 focus:outline-none"
-		/>
-		<Button type="submit" disabled={creating || !newName.trim()}>
-			{creating ? 'Creating…' : 'Create'}
-		</Button>
-	</form>
-
-	{#if error}<p class="mb-4 text-sm text-red-400">{error}</p>{/if}
-
-	{#if loading}
-		<Spinner label="loading…" />
-	{:else if projects.length === 0}
-		<p class="text-paper/40">No notebooks yet. Create one above to get started.</p>
-	{:else}
-		<ul class="flex flex-col">
-			{#each projects as p (p.id)}
-				<li>
-					<a
-						href={`/projects/${p.id}`}
-						class="flex items-center justify-between border-b border-paper py-3 hover:text-accent"
-					>
-						<span class="text-[20px]">{p.name}</span>
-						{#if p.description}<span class="text-sm text-paper/50">{p.description}</span>{/if}
-					</a>
-				</li>
-			{/each}
-		</ul>
-	{/if}
-</div>
+{:else}
+	<div class="flex h-screen items-center justify-center">
+		<Spinner size={28} label="opening notebook…" />
+	</div>
+{/if}

@@ -1,15 +1,22 @@
 <script>
 	import { page } from '$app/state';
+	import { goto } from '$app/navigation';
 	import { listProjects } from '$lib/api/projects.js';
 	import { listChats } from '$lib/api/chats.js';
 	import { session } from '$lib/stores/session.svelte.js';
 	import NotebookShell from '$lib/components/notebook/NotebookShell.svelte';
+	import OnboardingModal from '$lib/components/notebook/OnboardingModal.svelte';
 	import Spinner from '$lib/components/ui/Spinner.svelte';
 
 	const projectId = $derived(page.params.projectId ?? '');
+	// Set by the root redirect for a brand-new user's auto-created project: gate the
+	// page behind a forced modal until they name it and add their OpenRouter key.
+	const onboarding = $derived(page.url.searchParams.get('onboarding') === '1');
 
 	/** localStorage key for the last chat the user had open in a given project. */
 	const lastChatKey = (/** @type {string} */ pid) => `notebook:lastChat:${pid}`;
+	/** localStorage key for the most recently opened project (drives the root redirect). */
+	const LAST_PROJECT_KEY = 'notebook:lastProject';
 
 	let projectName = $state('Notebook');
 	/** @type {import('$lib/api/chats.js').ChatSummary[]} */
@@ -51,6 +58,12 @@
 		if (chatId && projectId) localStorage.setItem(lastChatKey(projectId), chatId);
 	});
 
+	// Remember this as the most recently used project, so hitting the base domain
+	// reopens it (see the root redirect in routes/+page.svelte).
+	$effect(() => {
+		if (projectId) localStorage.setItem(LAST_PROJECT_KEY, projectId);
+	});
+
 	/** @param {string} id */
 	function selectChat(id) {
 		chatId = id;
@@ -78,4 +91,14 @@
 		onSelectChat={selectChat}
 		onNewChat={newChat}
 	/>
+	{#if onboarding}
+		<OnboardingModal
+			{projectId}
+			onDone={(name) => {
+				projectName = name;
+				// Drop the flag so the modal closes and a reload won't reopen it.
+				goto(`/projects/${projectId}`, { replaceState: true });
+			}}
+		/>
+	{/if}
 {/if}

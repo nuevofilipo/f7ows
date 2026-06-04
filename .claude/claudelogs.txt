@@ -1,3 +1,40 @@
+2026-06-04 — Removed notebooks list; base domain redirects into a project
+========================================================================
+
+WHAT
+- New PATCH /projects/{project_id} endpoint (app/library/projects.py) — partial
+  rename/update (name, description), scoped by user_id, 404 if not owned.
+- Root route (/) is no longer a notebook list. It redirects: to the most recently
+  used project (localStorage "notebook:lastProject", written by the notebook page),
+  else the newest. A brand-new user (zero projects) gets a project auto-created in
+  the background and lands in it with ?onboarding=1.
+- New forced OnboardingModal (dismissable={false}) gates that fresh project until
+  the user names it (PATCH) and stores an OpenRouter key (PUT /settings/openrouter-key).
+  Added a `dismissable` prop to the shared Modal component for this.
+- Frontend: api.patch() helper + updateProject().
+
+WHY
+- Finishes ditching the standalone list page. New users get a guided first-run
+  (name + key) instead of an empty list to figure out.
+
+
+2026-06-04 — Delete project endpoint + Projects section on Settings page
+=======================================================================
+
+WHAT
+- New DELETE /projects/{project_id} endpoint (app/library/projects.py). Scoped by
+  user_id so a user can only delete their own; 404 if not found. Children
+  (documents→chunks, messages, clusters, artifacts) cascade in the DB.
+- Settings (/profile) page now has a "Projects" section below the colour theme:
+  lists every notebook with a Delete button, confirmed via a modal before the
+  call. On success the row is removed from the list.
+- Frontend: added api.delete() helper (client.js) and deleteProject() (projects.js).
+
+WHY
+- Groundwork for ditching the standalone notebooks list page — creation already
+  moved to the notebook top bar (inline +), and now deletion lives in Settings.
+
+
 2026-06-04 — My Profile page + per-user OpenRouter key (BYOK) + accent theme
 ============================================================================
 
@@ -663,3 +700,29 @@ before the list is lazily loaded on first open.
 VERIFIED
 - backend: ast.parse on cost.py, llm.py, chat.py, deepsummary.py OK.
 - frontend: `npm run check` 0 errors (4 pre-existing benign warnings).
+
+---
+
+# Reset study progress button (projection page)
+
+WHAT
+- Added a "Reset study progress" feature so a project's study marks (actively/passively
+  studied) can be cleared back to not_studied from the projection page.
+- backend/app/chat/study.py: new clear_studied(project_id) — the deliberate inverse of
+  the monotonic mark_studied; sets chunks.study_status back to '{}'::jsonb for all chunks
+  in the project. Returns the count cleared.
+- backend/app/projections/api.py: new POST /projects/{id}/projection/reset endpoint
+  (owner-checked via _owned_project), calls clear_studied, returns {"cleared": n}.
+- frontend/src/lib/api/projection.js: resetStudyProgress(projectId) -> api.post(...).
+- frontend .../projection/+page.svelte: resetStudy() handler with a plain confirm(),
+  recolors the map locally (chunks -> study: 'not_studied') instead of refetching;
+  button pinned to the bottom of the Settings sidebar (mt-auto).
+
+WHY
+- Users need a way to start studying a project over without re-uploading sources. The
+  study state is monotonic by design (passive can't overwrite active), so a reset must be
+  a separate, explicit operation rather than something the chat path can do.
+
+VERIFIED
+- backend: venv python imports app.projections.api + app.chat.study OK (no circular import).
+- frontend: svelte-autofixer reports no issues on +page.svelte.

@@ -40,3 +40,11 @@ export const searchProjection = (projectId, q, method, k) =>
  */
 export const getProjectionChunk = (projectId, chunkId) =>
 	api.get(`/projects/${projectId}/projection/chunks/${chunkId}`);
+
+/**
+ * Reset every chunk's study state back to `not_studied` for this project.
+ * @param {string} projectId
+ * @returns {Promise<{ cleared: number }>}
+ */
+export const resetStudyProgress = (projectId) =>
+	api.post(`/projects/${projectId}/projection/reset`);
