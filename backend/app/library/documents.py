@@ -23,8 +23,8 @@ _MAX_BYTES = 50 * 1024 * 1024  # 50 MB upload cap, WHY is this necessary, could 
 
 
 def _document_dict(row) -> dict:
-    # asyncpg returns jsonb as a JSON string (no codec registered), so parse the
-    # status blob back into a dict for clients (UI polls status.state).
+    # `status` is TEXT holding a JSON object (SQLite has no JSON type), so parse
+    # it back into a dict for clients (the UI polls status.state).
     status = row["status"]
     if isinstance(status, str):
         try:
@@ -46,7 +46,7 @@ async def _owned_project(project_id: UUID, user_id) -> None:
     """404 unless the project exists and belongs to the current user."""
     async with acquire() as conn:
         owner = await conn.fetchval(
-            "SELECT 1 FROM projects WHERE id = $1 AND user_id = $2",
+            "SELECT 1 FROM projects WHERE id = ? AND user_id = ?",
             project_id, user_id,
         )
     if owner is None:
@@ -75,7 +75,7 @@ async def _store_and_enqueue(project_id: UUID, file: UploadFile) -> dict:
         row = await conn.fetchrow(
             """
             INSERT INTO documents (id, project_id, name, storage_key, content_type, size_bytes)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            VALUES (?, ?, ?, ?, ?, ?)
             RETURNING id, name, storage_key, content_type, size_bytes, status, created_at
             """,
             document_id, project_id, name, storage_key, "application/pdf", len(data),
@@ -134,7 +134,7 @@ async def list_documents(
         rows = await conn.fetch(
             """
             SELECT id, name, storage_key, content_type, size_bytes, status, created_at
-            FROM documents WHERE project_id = $1
+            FROM documents WHERE project_id = ?
             ORDER BY created_at DESC
             """,
             project_id,

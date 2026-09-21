@@ -1,18 +1,28 @@
 fastapi>=0.115
 uvicorn[standard]>=0.34
-asyncpg>=0.30
-pgvector>=0.3.6
-sqlalchemy>=2.0.36
-alembic>=1.16
-psycopg[binary]>=3.2
+aiosqlite>=0.22
+sqlite-vec>=0.1.9
 PyJWT>=2.9
 argon2-cffi>=23.1
-cryptography>=44.0
-arq>=0.26
-boto3>=1.38
+keyring>=25.7
 python-dotenv>=1.1
 httpx>=0.27
-tiktoken>=0.7
 python-multipart>=0.0.9
+# PDF text extraction. This is the parse path the app actually runs: parse()
+# defaults to use_models=False and nothing passes True, so pypdfium2 is a hard
+# runtime requirement, not an optional accelerator. It was missing here — a
+# fresh install ImportError'd on the first upload.
+pypdfium2>=4.30
+# Imported directly (worker, clusters, projections), not just pulled in by the
+# two below.
+numpy>=1.26
 scikit-learn>=1.5
 umap-learn>=0.5.6
+
+# NOT a dependency, deliberately: `docling` gives the high-fidelity parse path
+# (parse(use_models=True)), but it resolves to docling-slim[standard], which
+# drags in torch + torchvision + transformers + accelerate — ~700 MB, and ~3 GB
+# more of model weights on first run. Nothing in the app passes use_models=True
+# today. Per TODO_desktop.md phase 7 it stays an opt-in in-app download rather
+# than something every user installs. To develop against it:
+#     pip install docling

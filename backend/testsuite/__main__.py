@@ -4,8 +4,9 @@
     python -m testsuite chat       # terminal chat REPL against the test project
     python -m testsuite clean      # wipe the test project's data (add --runs to clear runs/)
 
-`ingest` and `chat` auto-start uvicorn + arq for you (Postgres/Redis/bucket must
-already be reachable via backend/.env). Each real call drops a trace into runs/.
+`ingest` and `chat` auto-start uvicorn + the worker for you. Nothing external
+needs to be running: the database is a file and the queue is a table in it.
+Each real call drops a trace into runs/.
 """
 from __future__ import annotations
 
@@ -38,12 +39,14 @@ def _wait_for_finalize(project_id: str, *, timeout: float = 180.0, interval: flo
                         """
                         SELECT
                           (SELECT COUNT(*) FROM chunks c JOIN documents d ON d.id = c.document_id
-                             WHERE d.project_id = $1) AS total,
+                             WHERE d.project_id = ?) AS total,
                           (SELECT COUNT(*) FROM chunks c JOIN documents d ON d.id = c.document_id
-                             WHERE d.project_id = $1 AND c.umap_2d IS NOT NULL) AS projected,
-                          (SELECT COUNT(*) FROM clusters WHERE project_id = $1) AS clusters
+                             WHERE d.project_id = ? AND c.umap_2d IS NOT NULL) AS projected,
+                          (SELECT COUNT(*) FROM clusters WHERE project_id = ?) AS clusters
                         """,
-                        UUID(project_id),
+                        # Three placeholders, one value: positional parameters are
+                        # matched by position, so a repeated $1 has to be repeated.
+                        UUID(project_id), UUID(project_id), UUID(project_id),
                     )
                 if row["total"] and row["projected"] >= row["total"]:
                     print(f"  projections done ({row['projected']}/{row['total']} chunks), "
@@ -130,33 +133,25 @@ def cmd_clean(args) -> int:
         await create_pool()
         try:
             async with acquire() as conn:
-                uid = await conn.fetchval("SELECT id FROM users WHERE email = $1", TEST_EMAIL)
+                uid = await conn.fetchval("SELECT id FROM users WHERE email = ?", TEST_EMAIL)
                 if uid is None:
                     print(f"[clean] no test user ({TEST_EMAIL}) — nothing to wipe")
                 else:
                     # Deleting projects cascades to documents/chunks/messages/clusters/artifacts.
-                    res = await conn.execute(
-                        "DELETE FROM projects WHERE user_id = $1 AND name = $2", uid, TEST_PROJECT_NAME
+                    cursor = await conn.execute(
+                        "DELETE FROM projects WHERE user_id = ? AND name = ?", uid, TEST_PROJECT_NAME
                     )
-                    print(f"[clean] {res} (test project '{TEST_PROJECT_NAME}')")
+                    print(f"[clean] deleted {cursor.rowcount} "
+                          f"(test project '{TEST_PROJECT_NAME}')")
         finally:
             await close_pool()
-        # Flush the ARQ queue too: a previous interrupted run leaves orphaned jobs
-        # in Redis that the next worker drains against now-deleted docs (noisy
-        # "document not found" failures) and can starve fresh jobs.
-        from arq import create_pool as create_redis
-        from arq.connections import RedisSettings
-
-        from app.config import settings
-
-        redis = await create_redis(RedisSettings.from_dsn(settings.redis_public_url))
-        try:
-            keys = await redis.keys("arq:*")
-            if keys:
-                await redis.delete(*keys)
-            print(f"[clean] flushed {len(keys)} ARQ redis key(s)")
-        finally:
-            await redis.aclose()
+            # Flush the queue too: a previous interrupted run leaves jobs behind
+            # that the next worker drains against now-deleted documents (noisy
+            # "document not found" failures) and that can starve fresh jobs.
+            # Same connection as the wipe above — the queue is a table now.
+            async with acquire() as conn:
+                cursor = await conn.execute("DELETE FROM jobs")
+                print(f"[clean] flushed {cursor.rowcount} queued job(s)")
 
     asyncio.run(_wipe())
     if args.runs and RUNS_DIR.exists():

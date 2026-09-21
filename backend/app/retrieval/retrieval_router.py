@@ -5,7 +5,7 @@ Global queries (``/deepsummary``, ``/mockexam``, "summarise everything") embed
 poorly, so instead of one retrieval method we route by **intent** — a three-level
 distinction — to the strategy that answers the question without over-fetching:
 
-    intent "specific"                  -> pgvector top-k over content_full
+    intent "specific"                  -> sqlite-vec top-k over content_full
     intent "inbetween"                 -> agentic ltree skeleton (LLM picks the
                                           relevant branches; ANY corpus size)
     intent "global", corpus <= budget  -> brute stuff all content_sparse
@@ -26,7 +26,7 @@ This module only *gathers* context (returns the assembled text + the chunks it
 came from). It does not call the answering LLM — that's the chat layer's job.
 
 The corpus size that drives the stuff-vs-skeleton choice for a global query is
-estimated cheaply from ``SUM(length(content_sparse))`` (≈ chars/4 tokens) so we
+estimated cheaply from ``SUM(length(content_sparse))`` (see app/tokens.py) so we
 never load a huge corpus just to decide we shouldn't load it.
 """
 from __future__ import annotations
@@ -36,13 +36,13 @@ import logging
 from dataclasses import dataclass, field
 
 from app import trace
-from app.db import acquire
+from app.db import acquire, descendants_of, placeholders, serialize_vector
 from app.embed import embed
+from app.tokens import CHARS_PER_TOKEN, estimate as _count
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BUDGET = 15_000   # sparse-token threshold between "stuff it" and routing
-_CHARS_PER_TOKEN = 4      # rough estimate for the cheap corpus-size check -> could do this with tiktoken instead for accurate token counts
 
 # Keyword sniffs for the cheap "specific vs not" pass. A hit only means "not a
 # precise lookup" — the inbetween/global split is then made by the LLM. Slash
@@ -61,20 +61,18 @@ class RetrievalResult:
     meta: dict = field(default_factory=dict)
 
 
-# ── token counting (local, lazy tiktoken) ──────────────────────────────────
-_enc = None
+def _scope(document_ids) -> tuple[str, list]:
+    """The optional "only these sources" filter, as SQL + its parameters.
 
-
-def _count(text: str) -> int:
-    global _enc
-    if _enc is None:
-        try:
-            import tiktoken
-
-            _enc = tiktoken.get_encoding("o200k_base")
-        except Exception:  # noqa: BLE001
-            _enc = False
-    return len(_enc.encode(text)) if _enc else max(1, len(text) // _CHARS_PER_TOKEN)
+    Postgres took the whole selection as one array parameter and could express
+    "unfiltered" as a NULL array (``$4::uuid[] IS NULL OR d.id = ANY($4)``).
+    SQLite has no array parameter, so the list is expanded into the statement —
+    which means the *absence* of a filter is now an absent fragment rather than a
+    NULL argument.
+    """
+    if not document_ids:
+        return "", []
+    return f" AND d.id IN ({placeholders(document_ids)})", list(document_ids)
 
 
 def _is_specific(query: str) -> bool:
@@ -139,17 +137,27 @@ def _assemble(rows, *, budget: int) -> tuple[str, list[dict], int]:
 # ── strategy 1: specific lookup ─────────────────────────────────────────────
 async def _specific(project_id, query: str, k: int, document_ids=None) -> RetrievalResult:
     [vector] = await embed([query])
+    scope, scope_args = _scope(document_ids)
     async with acquire() as conn:
+        # A full scan with vec_distance_cosine() rather than sqlite-vec's `MATCH
+        # ... k = ?` KNN form. The KNN form cannot be combined with the project
+        # and source-selection joins, and at this app's ceiling (~50k chunks x
+        # 1024 dims) the exhaustive scan is a fraction of a second — the same
+        # brute-force choice the schema was designed around. The join to
+        # chunk_vectors also replaces the old `embedding IS NOT NULL` test: a
+        # chunk without a vector simply has no row there.
         rows = await conn.fetch(
-            """
-            SELECT c.id, c.path, c.content_full, (c.embedding <=> $2::halfvec) AS distance
-            FROM chunks c JOIN documents d ON d.id = c.document_id
-            WHERE d.project_id = $1 AND c.embedding IS NOT NULL
-              AND ($4::uuid[] IS NULL OR d.id = ANY($4::uuid[]))
-            ORDER BY c.embedding <=> $2::halfvec
-            LIMIT $3
+            f"""
+            SELECT c.id, c.path, c.content_full,
+                   vec_distance_cosine(v.embedding, ?) AS distance
+            FROM chunks c
+            JOIN chunk_vectors v ON v.chunk_seq = c.seq
+            JOIN documents d ON d.id = c.document_id
+            WHERE d.project_id = ?{scope}
+            ORDER BY distance
+            LIMIT ?
             """,
-            project_id, vector, k, document_ids,
+            serialize_vector(vector), project_id, *scope_args, k,
         )
     chunks = [{"id": str(r["id"]), "path": str(r["path"]), "content_full": r["content_full"],
                "distance": float(r["distance"])} for r in rows]
@@ -159,24 +167,24 @@ async def _specific(project_id, query: str, k: int, document_ids=None) -> Retrie
 
 # ── strategy 2: brute-force stuffing ────────────────────────────────────────
 async def _stuff(project_id, budget: int, document_ids=None) -> RetrievalResult:
+    scope, scope_args = _scope(document_ids)
     async with acquire() as conn:
         rows = await conn.fetch(
-            """
+            f"""
             SELECT c.id, c.path, c.content_sparse
             FROM chunks c JOIN documents d ON d.id = c.document_id
-            WHERE d.project_id = $1 AND c.content_sparse IS NOT NULL
-              AND ($2::uuid[] IS NULL OR d.id = ANY($2::uuid[]))
+            WHERE d.project_id = ? AND c.content_sparse IS NOT NULL{scope}
             ORDER BY c.path
             """,
-            project_id, document_ids,
+            project_id, *scope_args,
         )
     context, chunks, total = _assemble(rows, budget=budget)
     return RetrievalResult("stuff", context, chunks, total, {"available": len(rows)})
 
 
-# ── strategy 3: agentic ltree skeleton ──────────────────────────────────────
+# ── strategy 3: agentic path skeleton ───────────────────────────────────────
 _PLANNER_SYSTEM = (
-    "You are a retrieval planner. Given a table of contents (ltree paths) and a "
+    "You are a retrieval planner. Given a table of contents (dotted paths) and a "
     "user question, choose the path prefixes whose branches are most relevant. "
     "Reply with ONLY a JSON array of path strings copied verbatim from the list, "
     "no prose."
@@ -189,16 +197,16 @@ async def _skeleton(project_id, query: str, budget: int, planner_max_tokens: int
                     document_ids=None) -> RetrievalResult:
     from app.llm import LLMError, complete
 
+    scope, scope_args = _scope(document_ids)
     async with acquire() as conn:
         toc = [str(r["path"]) for r in await conn.fetch(
-            """
+            f"""
             SELECT DISTINCT c.path
             FROM chunks c JOIN documents d ON d.id = c.document_id
-            WHERE d.project_id = $1 AND c.path IS NOT NULL
-              AND ($2::uuid[] IS NULL OR d.id = ANY($2::uuid[]))
+            WHERE d.project_id = ? AND c.path IS NOT NULL{scope}
             ORDER BY c.path
             """,
-            project_id, document_ids,
+            project_id, *scope_args,
         )]
     if not toc:
         return RetrievalResult("skeleton", "", [], 0, {"reason": "empty toc"})
@@ -223,16 +231,18 @@ async def _skeleton(project_id, query: str, budget: int, planner_max_tokens: int
     if not selected:
         selected = toc  # planner found nothing specific -> consider the whole tree
 
+    # `path <@ ANY(selected)` becomes an OR of prefix tests, one per branch the
+    # planner picked.
+    branches, branch_args = descendants_of("c.path", selected)
     async with acquire() as conn:
         rows = await conn.fetch(
-            """
+            f"""
             SELECT c.id, c.path, c.content_sparse
             FROM chunks c JOIN documents d ON d.id = c.document_id
-            WHERE d.project_id = $1 AND c.path <@ ANY($2::ltree[])
-              AND ($3::uuid[] IS NULL OR d.id = ANY($3::uuid[]))
+            WHERE d.project_id = ? AND {branches}{scope}
             ORDER BY c.path
             """,
-            project_id, selected, document_ids,
+            project_id, *branch_args, *scope_args,
         )
     context, chunks, total = _assemble(rows, budget=budget)
     return RetrievalResult("skeleton", context, chunks, total,
@@ -279,17 +289,17 @@ async def route(
         # Estimate corpus size cheaply: if the whole thing fits, stuff it (highest
         # fidelity); otherwise the skeleton selects branches and caps to budget,
         # degrading to a budget-capped stuff when the planner picks everything.
+        scope, scope_args = _scope(document_ids)
         async with acquire() as conn:
             chars = await conn.fetchval(
-                """
+                f"""
                 SELECT COALESCE(SUM(length(c.content_sparse)), 0)
                 FROM chunks c JOIN documents d ON d.id = c.document_id
-                WHERE d.project_id = $1
-                  AND ($2::uuid[] IS NULL OR d.id = ANY($2::uuid[]))
+                WHERE d.project_id = ?{scope}
                 """,
-                project_id, document_ids,
+                project_id, *scope_args,
             )
-        corpus_tokens = int(chars) // _CHARS_PER_TOKEN
+        corpus_tokens = int(int(chars) / CHARS_PER_TOKEN)
         result = (await _stuff(project_id, budget, document_ids) if corpus_tokens <= budget
                   else await _skeleton(project_id, query, budget, planner_max_tokens, document_ids))
         result.meta["corpus_tokens"] = corpus_tokens

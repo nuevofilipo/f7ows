@@ -76,8 +76,8 @@ async def _section(project_id, subtopic: str, prefs: Preferences, sem: asyncio.S
 async def _set_result(message_id, content: str, metadata: dict) -> None:
     async with acquire() as conn:
         await conn.execute(
-            "UPDATE messages SET content = $2, metadata = $3::jsonb WHERE id = $1",
-            message_id, content, json.dumps(metadata),
+            "UPDATE messages SET content = ?, metadata = ? WHERE id = ?",
+            content, json.dumps(metadata), message_id,
         )
 
 
@@ -111,10 +111,11 @@ async def run(project_id, topic: str, prefs: Preferences, message_id, document_i
                         seen.add(c["id"])
             tr.write("final.md", document)
 
+            spend = cost.summary()      # usd is None when nothing was priced
             await _set_result(message_id, document, {
                 "state": "ready", "command": "deepsummary", "topic": topic,
                 "outline": outline, "sections": sections_meta, "cited": union,
-                "cost": cost.total(),
+                "cost": spend["usd"], "unpriced_calls": spend["unpriced_calls"],
             })
             # A deep summary is passive review -> mark every cited chunk studied.
             await mark_studied(project_id, [c["id"] for c in union], PASSIVELY_STUDIED)

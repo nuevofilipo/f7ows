@@ -33,6 +33,19 @@ import string
 import unicodedata
 from dataclasses import dataclass, field
 
+# Allow running this file directly (`python app/chunk/chunk.py`) as well as
+# `python -m app.chunk.chunk`: with no package context, put the backend root on
+# sys.path so the `app.*` import below resolves. Same guard as app/embed/embed.py.
+if __package__ in (None, ""):
+    import pathlib
+    import sys
+
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+
+# Sizing, not a hard limit: chunk packing tolerates a few percent of drift, and
+# errors average out across a whole chunk. See app/tokens.py.
+from app.tokens import estimate as count_tokens
+
 logger = logging.getLogger(__name__)
 
 # Token target per chunk (PHASE4_PLAN_v2 §2.B). Soft bounds: an indivisible atom
@@ -55,28 +68,6 @@ class Chunk:
     path: str                  # ltree, e.g. "doc.attention.self_attention"
     heading_trail: list[str] = field(default_factory=list)  # human headings, for UI/metadata
     token_count: int = 0       # tokens in content_full
-
-
-# ---------------------------------------------------------------------------
-# Token counting — tiktoken if available (matches text-embedding-3-large's
-# o200k_base), else a cheap word-count estimate so chunking never hard-depends
-# on the optional package.
-# ---------------------------------------------------------------------------
-_count_tokens = None
-
-
-def _token_counter():
-    global _count_tokens
-    if _count_tokens is None:
-        try:
-            import tiktoken
-
-            enc = tiktoken.get_encoding("o200k_base")
-            _count_tokens = lambda s: len(enc.encode(s))  # noqa: E731
-        except Exception:  # noqa: BLE001 - fall back to an estimate, don't crash
-            logger.warning("chunk: tiktoken unavailable, using word-count token estimate")
-            _count_tokens = lambda s: int(len(s.split()) * 1.3) + 1  # noqa: E731
-    return _count_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -388,13 +379,12 @@ def chunk(markdown: str, *, doc_slug: str) -> list[Chunk]:
         Chunks in document order, each with ``content_full``, ``content_sparse``,
         an ltree ``path``, the human ``heading_trail`` and a ``token_count``.
     """
-    count = _token_counter()
     doc_slug = _slugify(doc_slug) or "doc"
 
     atoms: list[_Atom] = []
     for sec in _split_sections(markdown, doc_slug):
         for text in _atomize(sec.body):
-            atoms.append(_Atom(text, sec.slug_trail, sec.title_trail, count(text)))
+            atoms.append(_Atom(text, sec.slug_trail, sec.title_trail, count_tokens(text)))
     if not atoms:
         return []
 
@@ -415,7 +405,7 @@ def chunk(markdown: str, *, doc_slug: str) -> list[Chunk]:
             content_sparse=_compress(content_full),
             path=path,
             heading_trail=trail,
-            token_count=count(content_full),
+            token_count=count_tokens(content_full),
         ))
     return chunks
 
@@ -442,9 +432,8 @@ if __name__ == "__main__":
         raise SystemExit(f"Run the parser harness first to produce {md_path}")
 
     chunks = chunk(md_path.read_text(encoding="utf-8"), doc_slug="test")
-    counter = _token_counter()
     full_tok = sum(c.token_count for c in chunks)
-    sparse_tok = sum(counter(c.content_sparse) for c in chunks)
+    sparse_tok = sum(count_tokens(c.content_sparse) for c in chunks)
     sizes = [c.token_count for c in chunks]
 
     print(f"{len(chunks)} chunks from {md_path.name}")

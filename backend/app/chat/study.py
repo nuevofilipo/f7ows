@@ -4,7 +4,7 @@ Study tracking — record how chunks have been studied so the map can colour the
 Every grounded answer cites a few chunks. *How* they were cited tells us how the
 material was studied: an active-recall command (a mock exam, later voice recall)
 exercises memory, while ordinary chat or a summary is passive review. We collapse
-that into one of three states stored on ``chunks.study_status`` (JSONB ``{"state":
+that into one of three states stored on ``chunks.study_status`` (JSON ``{"state":
 ...}``), which the projection map reads back to colour each point:
 
     actively_studied   — exercised via an active-recall command (filled accent)
@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 from uuid import UUID
 
-from app.db import acquire
+from app.db import acquire, placeholders
 
 logger = logging.getLogger(__name__)
 
@@ -52,24 +52,25 @@ async def mark_studied(project_id, chunk_ids, state: str) -> int:
 
     try:
         async with acquire() as conn:
-            result = await conn.execute(
-                """
-                UPDATE chunks c
-                SET study_status = jsonb_build_object('state', $1::text)
-                FROM documents d
-                WHERE c.document_id = d.id
-                  AND d.project_id = $2
-                  AND c.id = ANY($3::uuid[])
-                  AND $4::int > CASE c.study_status->>'state'
+            # The project scope is a subquery rather than Postgres' UPDATE..FROM:
+            # SQLite supports UPDATE..FROM too, but the join form cannot be
+            # combined with an expanded IN list as legibly, and this reads closer
+            # to the sentence "these chunks, if they belong to this project".
+            cursor = await conn.execute(
+                f"""
+                UPDATE chunks
+                SET study_status = json_object('state', ?)
+                WHERE id IN ({placeholders(ids)})
+                  AND document_id IN (SELECT id FROM documents WHERE project_id = ?)
+                  AND ? > CASE json_extract(study_status, '$.state')
                         WHEN 'actively_studied'  THEN 2
                         WHEN 'passively_studied' THEN 1
                         ELSE 0
                       END
                 """,
-                state, project_id, ids, rank,
+                state, *ids, project_id, rank,
             )
-        # asyncpg returns e.g. "UPDATE 3"; pull the row count off the tag.
-        return int(result.split()[-1]) if result else 0
+        return cursor.rowcount
     except Exception:  # noqa: BLE001 - never let study tracking break a reply
         logger.warning("mark_studied failed for project %s", project_id, exc_info=True)
         return 0
@@ -84,15 +85,17 @@ async def clear_studied(project_id) -> int:
     rather than a ``{"state": ...}`` blob. Returns the number of chunks cleared.
     """
     async with acquire() as conn:
-        result = await conn.execute(
+        # "has a state" rather than a literal <> '{}' comparison: study_status is
+        # TEXT, so two JSON objects that are equal can still differ as strings
+        # (key order, whitespace). Asking json1 whether the key is present is the
+        # comparison we actually mean.
+        cursor = await conn.execute(
             """
-            UPDATE chunks c
-            SET study_status = '{}'::jsonb
-            FROM documents d
-            WHERE c.document_id = d.id
-              AND d.project_id = $1
-              AND c.study_status <> '{}'::jsonb
+            UPDATE chunks
+            SET study_status = '{}'
+            WHERE document_id IN (SELECT id FROM documents WHERE project_id = ?)
+              AND json_extract(study_status, '$.state') IS NOT NULL
             """,
             project_id,
         )
-    return int(result.split()[-1]) if result else 0
+    return cursor.rowcount

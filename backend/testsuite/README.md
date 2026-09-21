@@ -2,7 +2,7 @@
 
 Drives the **real** backend over HTTP — exactly like the frontend will — so the
 tracer embedded in the backend (`app/trace.py`) drops human-readable artifacts
-into `backend/runs/` for every call. Same traces whether triggered from here or
+into the app cache dir (`<CACHE>/runs/`, i.e. `backend/devdata/cache/runs/` in dev) for every call. Same traces whether triggered from here or
 from a browser.
 
 ## Prerequisites
@@ -54,4 +54,4 @@ After each turn it prints the trace dir.
 - **project artifacts** (`project_<id8>/`): `clusters.md`, `projections.md`.
 
 Tracing is on by default (`TRACE=1`); set `TRACE=0` to disable, or `TRACE_DIR`
-to relocate the folder.
+to relocate the folder (`python -m app.paths` prints where it resolves to).

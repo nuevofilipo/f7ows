@@ -2,8 +2,8 @@
 Chat API — the core "talk to your sources" feature.
 
 A *chat* is a tree of messages sharing a ``chat_id`` in the `messages` table; the
-``path`` ltree column gives reddit-style nested threading for free. Sending a
-message:
+dotted ``path`` column gives reddit-style nested threading (``0001.0002``, see
+:func:`_next_child_path`). Sending a message:
 
   1. inserts the user message (under an explicit ``parent_path``, or linearly
      under the chat's latest message),
@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
@@ -30,7 +30,7 @@ from app.auth import get_current_user
 from app.chat import commands
 from app.chat.generate import cited_chunks, grounded_answer
 from app.chat.study import ACTIVELY_STUDIED, PASSIVELY_STUDIED, mark_studied
-from app.db import acquire
+from app.db import acquire, ancestors_of, placeholders
 from app.llm import LLMError
 from app.preferences import resolve
 
@@ -73,7 +73,7 @@ async def _owned_project(project_id: UUID, user_id) -> None:
     """404 unless the project exists and belongs to the current user."""
     async with acquire() as conn:
         owner = await conn.fetchval(
-            "SELECT 1 FROM projects WHERE id = $1 AND user_id = $2", project_id, user_id,
+            "SELECT 1 FROM projects WHERE id = ? AND user_id = ?", project_id, user_id,
         )
     if owner is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Project not found")
@@ -97,38 +97,54 @@ async def _validate_source_ids(project_id: UUID, raw) -> list[UUID] | None:
         return None
     async with acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id FROM documents WHERE project_id = $1 AND id = ANY($2::uuid[])",
-            project_id, parsed,
+            f"SELECT id FROM documents WHERE project_id = ? "
+            f"AND id IN ({placeholders(parsed)})",
+            project_id, *parsed,
         )
     valid = [r["id"] for r in rows]
     return valid or None
 
 
+# Sibling labels are zero-padded to this width. Both ltree and TEXT order labels
+# lexicographically, so an unpadded '10' sorts before '2' — which scrambled
+# `ORDER BY path` (and therefore the whole rendered thread) as soon as any level
+# reached ten siblings. Four digits is a thousand more replies than a branch will
+# ever hold; past 9999 the ordering degrades but nothing breaks.
+_LABEL_WIDTH = 4
+
+
 async def _next_child_path(conn, chat_id: UUID, parent_path: str | None) -> str:
-    """The next sibling ltree path under ``parent_path`` (or at the chat root)."""
+    """The next sibling path under ``parent_path`` (or at the chat root)."""
     if parent_path is None:
+        # Root-level messages are the ones with a single label, i.e. no dot.
         n = await conn.fetchval(
-            "SELECT COUNT(*) FROM messages WHERE chat_id = $1 AND nlevel(path) = 1", chat_id,
+            "SELECT COUNT(*) FROM messages WHERE chat_id = ? AND instr(path, '.') = 0",
+            chat_id,
         )
-        return str(n + 1)
+        return f"{n + 1:0{_LABEL_WIDTH}d}"
+    # Direct children only: below `parent_path`, and with nothing after their own
+    # label — substr() past the parent and its dot is that label, so it must
+    # contain no further dot. (GLOB, not LIKE: see app.db.descendants_of.)
     n = await conn.fetchval(
         """
         SELECT COUNT(*) FROM messages
-        WHERE chat_id = $1 AND path <@ $2::ltree AND nlevel(path) = nlevel($2::ltree) + 1
+        WHERE chat_id = ?
+          AND path GLOB ? || '.*'
+          AND instr(substr(path, length(?) + 2), '.') = 0
         """,
-        chat_id, parent_path,
+        chat_id, parent_path, parent_path,
     )
-    return f"{parent_path}.{n + 1}"
+    return f"{parent_path}.{n + 1:0{_LABEL_WIDTH}d}"
 
 
 async def _insert_message(conn, project_id, chat_id, path, role, content, metadata) -> dict:
     row = await conn.fetchrow(
         """
-        INSERT INTO messages (project_id, chat_id, path, role, content, metadata)
-        VALUES ($1, $2, $3::ltree, $4, $5, $6::jsonb)
+        INSERT INTO messages (id, project_id, chat_id, path, role, content, metadata)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         RETURNING id, chat_id, path, role, content, metadata, created_at
         """,
-        project_id, chat_id, path, role, content, json.dumps(metadata),
+        uuid4(), project_id, chat_id, path, role, content, json.dumps(metadata),
     )
     return _message_dict(row)
 
@@ -193,18 +209,22 @@ async def send_message(
         parent_path = body.get("parent_path")
         if parent_path is None:
             parent_path = await conn.fetchval(
-                "SELECT path FROM messages WHERE chat_id = $1 ORDER BY created_at DESC LIMIT 1",
+                "SELECT path FROM messages WHERE chat_id = ? ORDER BY created_at DESC LIMIT 1",
                 chat_id,
             )
         history = []
         if parent_path is not None:
+            # The conversation history is the branch from the root down to the
+            # parent, i.e. every message whose path is an ancestor of (or equal
+            # to) it — Postgres' `path @> $2`.
+            branch, branch_args = ancestors_of("path", str(parent_path))
             history = await conn.fetch(
-                """
+                f"""
                 SELECT role, content FROM messages
-                WHERE chat_id = $1 AND path @> $2::ltree AND role IN ('user', 'assistant')
+                WHERE chat_id = ? AND {branch} AND role IN ('user', 'assistant')
                 ORDER BY path
                 """,
-                chat_id, str(parent_path),
+                chat_id, *branch_args,
             )
         user_path = await _next_child_path(conn, chat_id, parent_path and str(parent_path))
         user_msg = await _insert_message(
@@ -248,8 +268,13 @@ async def send_message(
         cited = cited_chunks(answer, retrieval.chunks)
         # Command-specific structured output (e.g. the parsed mock-exam questions).
         extra = command.parse(answer) if command and command.parse else {}
+        # cost is None when no provider in this turn reported a price (a local
+        # model), which the UI shows as "no cost" rather than "$0.00" — the two
+        # are not the same claim. See app/cost.py.
+        spend = cost.summary()
         metadata = {"strategy": retrieval.strategy, "retrieval_tokens": retrieval.token_count,
-                    "retrieved": retrieved, "cited": cited, "level": level, "cost": cost.total(),
+                    "retrieved": retrieved, "cited": cited, "level": level,
+                    "cost": spend["usd"], "unpriced_calls": spend["unpriced_calls"],
                     "source_ids": [str(d) for d in document_ids] if document_ids else None, **extra}
         if command:
             metadata["command"] = command.name
@@ -279,13 +304,13 @@ async def list_messages(
     chat_id: UUID,
     current_user: dict = Depends(get_current_user),
 ) -> list[dict]:
-    """All messages in a chat, in tree order (ltree path)."""
+    """All messages in a chat, in tree order (by path)."""
     await _owned_project(project_id, current_user["id"])
     async with acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT id, chat_id, path, role, content, metadata, created_at
-            FROM messages WHERE project_id = $1 AND chat_id = $2
+            FROM messages WHERE project_id = ? AND chat_id = ?
             ORDER BY path
             """,
             project_id, chat_id,
@@ -304,7 +329,7 @@ async def list_chats(
         rows = await conn.fetch(
             """
             SELECT chat_id, COUNT(*) AS message_count, MAX(created_at) AS last_activity
-            FROM messages WHERE project_id = $1
+            FROM messages WHERE project_id = ?
             GROUP BY chat_id ORDER BY last_activity DESC
             """,
             project_id,

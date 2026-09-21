@@ -7,7 +7,7 @@ Single level for now (the `clusters` table keeps parent_id/level so this can gro
 into a recursive tree later without schema changes). Per PHASE4_PLAN_v2 §2.C each
 cluster carries:
 
-* **centroid** — mean embedding, in the original 3072-d space so it's directly
+* **centroid** — mean embedding, in the original (un-reduced) space so it's directly
   comparable to query vectors;
 * **medoid** — the real member chunk closest to that centroid (a concrete,
   quotable representative);

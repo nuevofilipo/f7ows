@@ -10,6 +10,7 @@
 	 *   actionTarget?: { message: import('$lib/api/chats.js').Message, mode: 'reply' | 'continue' } | null,
 	 *   lastTokens?: number | null,
 	 *   chatCost?: number,
+	 *   chatUnpriced?: boolean,
 	 *   onSend: (p: { content: string, command?: string }) => void,
 	 *   onCancelAction?: () => void
 	 * }}
@@ -21,14 +22,25 @@
 		actionTarget = null,
 		lastTokens = null,
 		chatCost = 0,
+		chatUnpriced = false,
 		onSend,
 		onCancelAction
 	} = $props();
 
 	// Format the running chat cost: more precision below a cent so sub-cent chats
 	// still read as a real number rather than "$0.00".
+	//
+	// A local model reports no price, which is not the same as costing nothing —
+	// so when nothing in the chat was priced, say that rather than show a dollar
+	// figure we'd be inventing. A mixed chat shows the part we know, marked "+".
 	const costLabel = $derived(
-		!chatCost ? '$0.00' : chatCost < 0.01 ? `$${chatCost.toFixed(4)}` : `$${chatCost.toFixed(3)}`
+		chatUnpriced && !chatCost
+			? 'local model, no cost'
+			: !chatCost
+				? '$0.00'
+				: chatCost < 0.01
+					? `$${chatCost.toFixed(4)}${chatUnpriced ? '+' : ''}`
+					: `$${chatCost.toFixed(3)}${chatUnpriced ? '+' : ''}`
 	);
 
 	let text = $state('');

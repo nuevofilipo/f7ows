@@ -2,7 +2,7 @@
 Projection API — read-only data for the map UI (PRD "Projection Page").
 
 The heavy lifting already happened in the worker: every chunk has pre-computed
-2D display coordinates (`umap_2d` / `pca_coords` / `tsne_coords`, JSONB) written by
+2D display coordinates (`umap_2d` / `pca_coords` / `tsne_coords`, JSON) written by
 ``recalculate_projections``. This router just *serves* them, plus a search that
 highlights matching chunks on the map.
 
@@ -13,20 +13,21 @@ Two endpoints, both scoped + owner-checked under a project:
   the worker runs (a fresh project), so ``ready`` says whether anything is
   plottable yet.
 * ``GET /projects/{id}/projection/search`` — rank chunks against a query by
-  cosine similarity (pgvector over the dense embedding) or BM25 (Postgres
-  full-text ``ts_rank``). Returns ids + scores; the frontend highlights those
-  points on the already-plotted map.
+  cosine similarity (sqlite-vec over the dense embedding) or BM25 (the FTS5
+  index over ``content_full``). Returns ids + scores; the frontend highlights
+  those points on the already-plotted map.
 """
 from __future__ import annotations
 
 import json
+import re
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.auth import get_current_user
 from app.chat.study import clear_studied
-from app.db import acquire
+from app.db import acquire, serialize_vector
 from app.embed import embed
 
 router = APIRouter(prefix="/projects/{project_id}/projection", tags=["projection"])
@@ -36,7 +37,7 @@ async def _owned_project(project_id: UUID, user_id) -> None:
     """404 unless the project exists and belongs to the current user."""
     async with acquire() as conn:
         owner = await conn.fetchval(
-            "SELECT 1 FROM projects WHERE id = $1 AND user_id = $2",
+            "SELECT 1 FROM projects WHERE id = ? AND user_id = ?",
             project_id, user_id,
         )
     if owner is None:
@@ -44,7 +45,7 @@ async def _owned_project(project_id: UUID, user_id) -> None:
 
 
 def _json(value):
-    """asyncpg hands back JSONB as a string (no codec registered); parse it.
+    """Coordinate and metadata columns are TEXT holding JSON; parse them.
     A coordinate column is null until the worker has projected the project."""
     if value is None:
         return None
@@ -57,7 +58,7 @@ def _json(value):
 
 
 def _study_state(study_status) -> str:
-    """Collapse a chunk's ``study_status`` JSONB into one of the three legend
+    """Collapse a chunk's ``study_status`` JSON into one of the three legend
     buckets the map colours by. The states are written by ``app.chat.study`` when
     a chunk is cited; an un-cited chunk keeps the default ``{}`` -> "not_studied":
 
@@ -94,7 +95,7 @@ async def get_projection(
                    d.name AS document_name
             FROM chunks c
             JOIN documents d ON d.id = c.document_id
-            WHERE d.project_id = $1
+            WHERE d.project_id = ?
             ORDER BY c.id
             """,
             project_id,
@@ -156,13 +157,32 @@ async def get_chunk_content(
             """
             SELECT c.content_full
             FROM chunks c JOIN documents d ON d.id = c.document_id
-            WHERE c.id = $1 AND d.project_id = $2
+            WHERE c.id = ? AND d.project_id = ?
             """,
             chunk_id, project_id,
         )
     if content is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Chunk not found")
     return {"id": str(chunk_id), "content_full": content}
+
+
+_FTS_TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
+
+
+def _fts_query(q: str) -> str:
+    """Turn free user text into a safe FTS5 MATCH expression.
+
+    MATCH takes a query *language*, not a literal — bare input containing a
+    quote, a ``*``, or a word like ``AND`` or ``NEAR`` is either a syntax error
+    (which surfaces as a 500) or silently means something the user did not ask
+    for. Postgres' plainto_tsquery did this sanitising for us; here we do it
+    ourselves: keep the alphanumeric runs, quote each one so it is a literal
+    term, and AND them together, which is what plainto_tsquery also did.
+
+    Returns "" when the query has no usable token (e.g. all punctuation), which
+    the caller turns into an empty result rather than a database error.
+    """
+    return " ".join(f'"{t}"' for t in _FTS_TOKEN.findall(q))
 
 
 @router.get("/search")
@@ -179,10 +199,10 @@ async def search_projection(
     floor, so the user judges relevance from what gets ringed (an empty/unrelated
     project simply highlights its closest, possibly-irrelevant, chunks).
 
-    * ``cosine`` — embed the query and order by pgvector cosine distance over the
-      dense embedding (semantic match). Score is similarity in [0, 1].
-    * ``bm25``   — Postgres full-text ``ts_rank`` over ``content_full`` (keyword
-      match). Score is the raw rank; only chunks that match the query are returned.
+    * ``cosine`` — embed the query and order by sqlite-vec cosine distance over
+      the dense embedding (semantic match). Score is similarity in [0, 1].
+    * ``bm25``   — FTS5 ``bm25()`` over ``content_full`` (keyword match). Score is
+      the negated BM25 rank; only chunks that match the query are returned.
     """
     await _owned_project(project_id, current_user["id"])
 
@@ -191,29 +211,35 @@ async def search_projection(
         async with acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT c.id, 1 - (c.embedding <=> $2::halfvec) AS score
-                FROM chunks c JOIN documents d ON d.id = c.document_id
-                WHERE d.project_id = $1 AND c.embedding IS NOT NULL
-                ORDER BY c.embedding <=> $2::halfvec
-                LIMIT $3
+                SELECT c.id, 1 - vec_distance_cosine(v.embedding, ?) AS score
+                FROM chunks c
+                JOIN chunk_vectors v ON v.chunk_seq = c.seq
+                JOIN documents d ON d.id = c.document_id
+                WHERE d.project_id = ?
+                ORDER BY score DESC
+                LIMIT ?
                 """,
-                project_id, vector, k,
+                serialize_vector(vector), project_id, k,
             )
     else:  # bm25 — keyword full-text ranking
+        match = _fts_query(q)
+        if not match:
+            return {"method": method, "query": q, "matches": []}
         async with acquire() as conn:
+            # FTS5's bm25() returns a *negative* score, most relevant most
+            # negative, so it is negated to keep the endpoint's contract
+            # ("higher is better") unchanged for the frontend.
             rows = await conn.fetch(
                 """
-                SELECT c.id,
-                       ts_rank(to_tsvector('english', c.content_full),
-                               plainto_tsquery('english', $2)) AS score
-                FROM chunks c JOIN documents d ON d.id = c.document_id
-                WHERE d.project_id = $1
-                  AND to_tsvector('english', c.content_full)
-                      @@ plainto_tsquery('english', $2)
+                SELECT c.id, -bm25(chunks_fts) AS score
+                FROM chunks_fts
+                JOIN chunks c ON c.seq = chunks_fts.rowid
+                JOIN documents d ON d.id = c.document_id
+                WHERE chunks_fts MATCH ? AND d.project_id = ?
                 ORDER BY score DESC
-                LIMIT $3
+                LIMIT ?
                 """,
-                project_id, q, k,
+                match, project_id, k,
             )
 
     return {

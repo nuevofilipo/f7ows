@@ -84,7 +84,7 @@
   });
 
   // Running dollar total for this chat — sum of the per-message cost the backend
-  // records from OpenRouter's reported usage.cost (see app/cost.py).
+  // records from the provider's reported usage.cost (see app/cost.py).
   const chatCost = $derived.by(() => {
     let sum = 0;
     for (const m of store.messages) {
@@ -93,6 +93,13 @@
     }
     return sum;
   });
+
+  // A local model reports no price at all, so the backend stores cost: null and
+  // counts those calls instead. "$0.00" would be a claim we can't make — the
+  // calls weren't free, their price is unknown — so the readout says so.
+  const chatUnpriced = $derived(
+    store.messages.some((m) => (m.metadata?.unpriced_calls ?? 0) > 0),
+  );
 
   /** @param {{ content: string, command?: string }} p */
   async function handleSend({ content, command }) {
@@ -168,6 +175,7 @@
     {actionTarget}
     {lastTokens}
     {chatCost}
+    {chatUnpriced}
     onSend={handleSend}
     onCancelAction={() => (actionTarget = null)}
   />

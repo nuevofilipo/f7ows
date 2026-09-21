@@ -726,3 +726,544 @@ WHY
 VERIFIED
 - backend: venv python imports app.projections.api + app.chat.study OK (no circular import).
 - frontend: svelte-autofixer reports no issues on +page.svelte.
+
+================================================================================
+2026-08-20 — TODO_desktop.md: phased plan for the desktop port
+
+WHAT
+- New TODO_desktop.md at the repo root: 9 phases (0 prep, 1 SQLite port, 2 kill
+  Redis/ARQ, 3 local file storage, 4 single local user + secrets, 5 provider
+  config, 6 frontend, 7 Tauri packaging, 8 polish). No code changed yet.
+
+WHY
+- Goal is a local desktop app with only LLM inference remaining remote (OpenRouter
+  by default, Ollama optional). Explored the backend first; the compute half
+  (pypdfium2 parse, chunking, UMAP/PCA/t-SNE, sklearn HDBSCAN) is already local,
+  so the port is really about the four cloud dependencies: Postgres, Redis, the
+  S3 bucket, and OpenRouter.
+
+DECISIONS RECORDED
+- SQLite + sqlite-vec over bundling Postgres. Bundled PG would save no rewrite but
+  costs ~30-40 MB installer / ~200 MB disk, initdb on first run, a per-platform
+  pgvector build, and a supervised process. The port is only ~43 SQL statements
+  (34 SELECT / 6 INSERT / 3 DELETE), of which ~6 touch ltree and ~4 vectors.
+  At the stated ceiling (<50k chunks/project) brute-force KNN is ~0.5s worst case,
+  and FTS5 gives real bm25() that the PG schema's unused to_tsvector index didn't.
+- ltree -> TEXT prefix matching. Only <@, @>, nlevel and ordering are used, and
+  labels are already slugified to [a-z0-9_] so the dot separator is unambiguous.
+  Logged the one trap: numeric chat sibling labels need zero-padding or text
+  ordering (1, 10, 2) scrambles thread order.
+- Redis exists only as ARQ's transport for 5 job functions -> replace with a jobs
+  table + polling, keeping producer.py's interface.
+- Local embeddings deferred: changing embed model changes the vector dim, which
+  invalidates stored vectors. Chat-via-Ollama lands first; embeddings need a
+  per-project embed_model/dim + re-embed job.
+
+================================================================================
+2026-08-20 — app/tokens.py: dropped the tiktoken dependency (desktop-port branch)
+
+WHAT
+- New backend/app/tokens.py: estimate() / estimate_upper() / upper_from_chars() /
+  clip(), plus a `python -m app.tokens` calibration harness that re-derives the
+  constants against real tiktoken counts (dev-only, tiktoken not imported at
+  module level).
+- Two divisors, not one: CHARS_PER_TOKEN = 3.75 (accurate mean, for sizing and
+  display) and CHARS_PER_TOKEN_SAFE = 3.0 (pessimistic, for anything guarding a
+  hard limit).
+- Replaced all three tiktoken call sites: chunk.py (_token_counter -> estimate),
+  embed.py (_truncate -> tokens.clip), retrieval_router.py (_count ->
+  estimate_upper, and the SQL corpus-size check -> upper_from_chars).
+- Removed tiktoken from requirements.txt and _CHARS_PER_TOKEN from the router.
+
+WHY
+- Desktop packaging: tiktoken is a Rust extension (another binary wheel for
+  PyInstaller) and it downloads its BPE file from the network on first use, so a
+  first ingest with no connection crashed. All three call sites already had
+  fallbacks, so this is subtraction.
+- Two divisors because the callers fail in opposite directions. Chunk packing
+  tolerates drift; the embed endpoint's 8192 cap and the retrieval context budget
+  do not — an underestimate there means a rejected batch or an overflowed context
+  window, an overestimate just wastes headroom.
+- Fixes two latent bugs in the old fallbacks: chunk.py estimated words*1.3 when
+  the measured value is 1.70 (~25% low), and embed.py clipped at
+  _MAX_INPUT_TOKENS*4 = 32000 chars, which is ~9.5k tokens on LaTeX-dense text —
+  over the 8192 hard cap it was meant to respect.
+
+CALIBRATION (measured, not guessed — 7 unique parsed STEM docs, 295 paragraphs)
+- chars/token: mean 3.67, min 3.35, max 4.13 at document level.
+- estimate():       mean err +5.9%, underestimates 30% of paragraphs.
+- estimate_upper(): mean err +32.3%, underestimates 9% of paragraphs.
+- LaTeX-dense text sits at the low end (every \frac/\partial costs several tokens
+  for a few characters), prose at the high end — hence the pessimistic divisor
+  sitting below the measured minimum.
+
+VERIFIED
+- Unit behaviour: empty -> 0, upper > estimate, upper_from_chars == estimate_upper,
+  clip() returns the same object when it fits and cuts on a word boundary otherwise.
+- app.main / app.worker / chunk / embed / retrieval_router all import clean.
+- Re-chunked the 7 real parsed docs and compared token_count against true
+  tiktoken counts: per-document estimate error -10% to +10%, chunk medians
+  620-862 tokens against the 400-800 target band — packing quality unchanged.
+- chunk.py still runs standalone (added the same sys.path guard embed.py uses).
+
+NOTE
+- Left one intentional word "tiktoken" in an embed.py comment explaining what the
+  old fallback got wrong.
+
+--------------------------------------------------------------------------------
+2026-08-20 (follow-up) — tokens.py simplified to a single estimator
+
+WHAT
+- Removed estimate_upper() and upper_from_chars(). app/tokens.py is now one
+  constant (CHARS_PER_TOKEN = 3.67, the measured corpus mean) and one function,
+  estimate(), plus clip() for truncation. Harness reports one number.
+- retrieval_router.py: _count is now `estimate`; the SQL corpus-size check does
+  `int(chars) / CHARS_PER_TOKEN` inline.
+- embed.py: _MAX_INPUT_TOKENS 8000 -> 7000.
+
+WHY
+- The two-divisor split was over-engineered. Nothing downstream needs an exact
+  count: chunk packing, the retrieval budget and the UI counter all tolerate a few
+  percent of drift, and the user-facing number is exact anyway once the response
+  returns usage.prompt_tokens. Having measured the real mean, use it.
+- The one genuine hard boundary is the embedding endpoint's 8192 cap, and that is
+  better handled by headroom in embed.py than by a second global divisor. At 3.67
+  chars/token a clip to 8000 tokens yields 29,360 chars, which on LaTeX-dense text
+  (3.35 chars/token) is ~8,760 real tokens — over the cap, rejecting the whole
+  batch. 7000 leaves the estimate ~15% of room to be wrong. Only pathological
+  inputs are clipped at all, so the spare budget costs nothing.
+
+VERIFIED
+- estimate('')==0, clip() returns the same object when it fits, cuts on a word
+  boundary otherwise; public API is now CHARS_PER_TOKEN / estimate / clip.
+- app.main, app.worker, chunk, embed, retrieval_router all import clean.
+- Calibration harness: mean 3.67 (min 3.35, max 4.13), estimate() error mean
+  +8.2%, p5 -34.7%, p95 +34.8% at paragraph level.
+- Re-chunked the 7 parsed docs against true tiktoken counts: per-doc error
+  -7.0%..+13.2%, chunk medians 620-788 against the 400-800 target band.
+
+================================================================================
+2026-08-20 — Phase 1 step 2: SQLite schema + PRAGMA user_version migrations
+
+WHAT
+- New backend/app/migrations.py: the whole schema as migration 1, plus a
+  migrate(db) runner driven by PRAGMA user_version. Harness: python -m app.migrations
+  builds a throwaway DB, prints the schema, and re-runs migrate() to prove idempotence.
+- Owns EMBED_DIM = 1024 (was 3072). The schema is the binding constraint — a vec0
+  table's dimension is fixed at creation — so it is the single source of truth and
+  embed.py will import it in step 3/4. NOTE: embed.py still says 3072; that
+  mismatch must be closed before any embedding is written.
+- Tables: users, projects, documents, chunks, chunk_vectors (vec0), chunks_fts
+  (fts5), messages, clusters, artifacts, jobs. Phase 2's jobs table is included
+  now so it doesn't need a migration next week.
+- Removed alembic.ini from git. backend/alembic/ is GITIGNORED (never tracked) so
+  its files were left on disk deliberately: deleting them would be unrecoverable,
+  and master still needs them to run the Postgres version until Phase 7.
+- requirements.txt: dropped sqlalchemy/alembic/psycopg, added aiosqlite +
+  sqlite-vec. asyncpg/pgvector stay until db.py is ported in step 3.
+
+WHY (schema decisions)
+- chunks gets `seq INTEGER PRIMARY KEY` beside the uuid `id`. vec0 and fts5 both
+  join on rowid, and for a table whose PK is TEXT, VACUUM may renumber the
+  implicit rowid — which would silently scramble both indexes. An explicit
+  INTEGER PRIMARY KEY is a stable alias.
+- clusters.centroid is a plain BLOB, not a vec0 row: nothing searches it by
+  similarity, the medoid strategy retrieves via medoid_chunk_id.
+- FTS5 is external-content (content='chunks', content_rowid='seq') so the index
+  doesn't store a second copy of content_full; three triggers maintain it, and the
+  delete trigger also reaps the row's vector because FK cascades do not reach
+  virtual tables.
+- tokenize='porter unicode61' reproduces the stemming Postgres' 'english' config
+  was doing.
+- Migrations are a tuple of separate statements, never one blob split on ';' —
+  CREATE TRIGGER bodies contain their own semicolons.
+
+VERIFIED (measured, on Windows)
+- Schema builds; migrate() is a no-op on second run.
+- FK cascade DOES fire chunks_after_delete without PRAGMA recursive_triggers —
+  I had flagged this as a risk; tested both ways, both reap vectors and FTS rows
+  correctly (3,3,3 -> 0,0,0). So recursive_triggers is NOT required and was
+  dropped from the connection pragmas rather than enabled speculatively.
+- ltree replacements: descendants-or-self via `path = ? OR path LIKE ? || '.%'`,
+  ancestors-or-self via `? = path OR ? LIKE path || '.%'` — both correct.
+- Zero-padding proven necessary: 12 unpadded messages order as
+  m1 m10 m11 m12 m2 ... ; padded ('0001') they order correctly.
+- json_extract(status,'$.state') replaces ->> ; finalize_project's pending query works.
+- vec0 KNN joined+scoped to a project works; bm25 keyword search scoped to a
+  project works with the sign flipped (-bm25() so higher = better, matching cosine).
+- Re-ingest path (DELETE FROM chunks WHERE document_id=?) leaves 0 orphans.
+
+GOTCHA WORTH REMEMBERING
+- aiosqlite deadlocks if you assign db.isolation_level after connecting. It must
+  be passed to aiosqlite.connect(isolation_level=None). migrate() raises a clear
+  error rather than hanging if handed a connection in the default mode.
+
+================================================================================
+2026-08-20 — Phase 1 step 3: db.py ported to SQLite, plus app/paths.py
+
+WHAT
+- app/paths.py (new): resolves data / cache / logs directories. Order:
+  F7OWS_*_DIR env (what the Tauri shell will pass to both sidecars) -> ./devdata/
+  when running from a source checkout -> OS conventions when frozen. Exposes
+  db_path(), documents_dir(), runs_dir(), models_dir(); `python -m app.paths` prints them.
+- app/db.py: asyncpg pool -> one aiosqlite connection per process. Loads
+  sqlite-vec, sets pragmas (WAL, foreign_keys=ON, busy_timeout=5000,
+  synchronous=NORMAL), runs migrate() on open, checkpoints the WAL on close.
+  Keeps the names main.py/worker.py already import (create_pool / close_pool /
+  get_pool / acquire), so neither file changed.
+- Connection: a thin asyncpg-shaped adapter (fetch / fetchrow / fetchval /
+  execute / executemany / transaction) so step 4 only rewrites SQL, not the
+  Python around it. execute() returns the cursor so the ingest path can read
+  lastrowid to link a chunk to its vector.
+- embed.py now imports EMBED_DIM from app.migrations (1024). The 3072/1024
+  mismatch flagged in step 2 is closed.
+- .gitignore: backend/devdata/.
+
+WHY (the two decisions)
+- One connection per process, not a pool: SQLite serialises writes anyway, so a
+  pool mostly buys threads that queue behind each other. Cross-process
+  concurrency is WAL + busy_timeout, which is what actually matters here (web
+  reads while the worker writes).
+- acquire() holds an asyncio.Lock for its whole block. With a single shared
+  connection two tasks could otherwise interleave statements, and a write from
+  task B could land inside task A's open transaction. Verified first that no
+  acquire() block in this codebase awaits anything slow (no LLM/network call is
+  made while holding one), so serialising costs nothing.
+- transaction() uses BEGIN IMMEDIATE, not BEGIN: a deferred transaction takes its
+  write lock lazily, so two processes that both read then write deadlock instead
+  of queueing.
+
+TRAP AVOIDED (measured)
+- Did not use sqlite3.Row. Its `in` operator iterates the row's VALUES, not its
+  column names, so auth.py's `"openrouter_key" in row` would have quietly
+  evaluated False and the user's BYOK key would never have loaded. app.db.Row is
+  a dict subclass that also supports positional access, so row["x"], row[0],
+  "x" in row and dict(row) all behave like asyncpg's Record.
+
+VERIFIED (10 checks, on a scratch DB via the env override)
+- env override respected; execute() exposes lastrowid; Row semantics incl. the
+  `in` trap; fetchval returns None on no rows; executemany populates FTS via the
+  trigger (5 chunks -> 5 fts rows); transaction() commits and rolls back; FK
+  cascade from users wipes projects/documents/chunks/vectors/fts; 10 concurrent
+  acquire() blocks with 0 interleaving; close_pool() checkpoints the WAL away.
+- app.main / app.worker / app.db / app.paths / app.migrations / app.embed all import.
+- created_at lands as ISO-8601 UTC ('2026-08-20T13:25:50.614Z').
+
+STATE
+- The app does NOT run yet: every SQL statement still uses $1 placeholders and
+  Postgres syntax. That is step 4, split into 4 passes (easy tables, JSON, paths,
+  vectors+search).
+
+================================================================================
+2026-08-28 — Phase 3: local file storage (boto3 -> pathlib), traces to the cache dir
+
+WHAT
+- app/library/storage.py: S3/boto3 wrapper -> files under paths.data_dir().
+  upload_bytes / download_bytes keep their async signatures, so documents.py and
+  worker.py did not change. content_type is accepted and ignored (the filesystem
+  has nowhere to put it; documents.content_type already records it).
+- app/trace.py: RUNS_DIR constant -> _runs_dir() returning paths.runs_dir()
+  (<CACHE>/runs), TRACE_DIR still overriding.
+- testsuite/config.py: RUNS_DIR follows the same resolution, so the driver reads
+  the runs the server just wrote.
+- app/config.py, .env, requirements.txt: the 5 BUCKET_* settings and boto3 gone.
+
+WHY THESE CHOICES
+- Storage root is data_dir(), NOT paths.documents_dir(). storage_key already
+  begins with "documents/" (documents.py:71), so resolving against documents_dir()
+  would have produced documents/documents/<...>. Keys stay verbatim -> zero
+  migration for rows already in the DB. Fixed documents_dir()'s docstring, which
+  claimed the key had no such prefix.
+- Traces went to the CACHE dir, not the data dir the TODO line said. runs/ grows
+  without bound and is regenerable; under data it would ride along in every
+  backup of the user's real work.
+- _runs_dir() is a function, not a module constant: paths.runs_dir() mkdirs, and
+  trace.py is imported on every request path whether TRACE is on or off. As a
+  constant it would have created directories at import time even with TRACE=0.
+
+TRAP AVOIDED
+- Keys are built from user-supplied filenames. A bucket flattens "../x" into a
+  harmless key; a filesystem does not. _resolve() resolves the path and requires
+  the data dir to be among its parents, which also catches drive letters
+  (C:\...), absolute paths, and symlinks pointing out of the tree. Verified all
+  5 shapes raise ValueError.
+- Write-then-rename (.part -> final): the old bucket PUT was atomic, a plain
+  write_bytes is not. A crash mid-write would otherwise leave a truncated PDF
+  that parses to garbage on the next ingest.
+
+VERIFIED (scratch dir via F7OWS_DATA_DIR / F7OWS_CACHE_DIR)
+- 2 KB round-trip byte-identical; overwrite of the same key; no .part residue;
+  5 traversal keys rejected; missing key -> FileNotFoundError; begin_run() and
+  project_artifact() write into <CACHE>/runs.
+- app.config / app.library.documents / app.library.storage / app.trace /
+  testsuite.config all import; settings has no bucket_* attributes left.
+
+STATE / NOT DONE
+- Independent of the Phase 1 SQLite work in flight. Only shared file touched is
+  config.py (deleting the bucket block) — merge conflict risk is low but real.
+- backend/runs/ still holds 54 old trace dirs. Gitignored, nothing reads them.
+- generate_apkg's "upload to R2" was only a docstring on a stub; reworded.
+
+================================================================================
+2026-08-28 — Phase 1 step 4: every SQL call site ported to SQLite
+
+WHAT
+- The ~43 remaining statements across 11 modules moved off Postgres: auth,
+  projects, documents, preferences, chat, study, sweep, deepsummary, retrieval
+  router, projections api, worker. $1 -> ? by hand, as step 3 planned.
+- app/db.py grew the cross-cutting pieces the port needed in more than one place:
+  * sqlite3.register_adapter(UUID, str) — Postgres had a native uuid type;
+    without this every UUID argument raises "type 'UUID' is not supported".
+    Registering once beats a str() at forty-odd argument positions, each of which
+    is a chance to miss one and get a 500 on a rarely-hit route. Ids now come
+    back OUT as str, never UUID — which is what the API already emitted, since
+    FastAPI serialised asyncpg's UUIDs to strings anyway.
+  * placeholders() — SQLite has no array parameter, so `= ANY($1::uuid[])` has to
+    be expanded into the SQL text.
+  * descendants_of() / ancestors_of() — the ltree <@ and @> operators.
+  * serialize_vector() — the float32 blob sqlite-vec both stores and queries with.
+- migrations._NOW promoted to public NOW, re-exported from db.py: it is the
+  column DEFAULT *and* what the queries that used NOW() need. If those two ever
+  drift apart, rows written by a default and rows written by a query stop
+  comparing correctly — which is exactly what the sweep depends on.
+- requirements.txt: asyncpg + pgvector dropped (their last users are gone).
+- scripts/check_sqlite_port.py (new): 63 assertions, real PDF, only embed stubbed.
+
+THE TRAP THAT ALMOST GOT THROUGH (has a regression test)
+- ltree `<@` reads naturally as `LIKE 'prefix.%'`, and that is what the TODO line
+  suggested. It is wrong here: chunk path labels are slugified to [a-z0-9_]
+  (chunk.py:79) and `_` is a single-character wildcard in LIKE. `LIKE 'a_b.%'`
+  also matches 'axb.leaf' — a different branch of the tree. Retrieval would have
+  silently pulled chunks from the wrong section, with no error anywhere and
+  nothing in the output to make it obvious.
+  Everything uses GLOB instead: its metacharacters are * ? [ ], none of which a
+  slugified label or a zero-padded message label can contain.
+- Same operator, second half: `<@` includes the prefix row itself, which
+  `GLOB 'p.*'` does not match. Hence the `col = ? OR col GLOB ? || '.*'` pair
+  rather than just the GLOB.
+
+OTHER DECISIONS
+- Vector search is a brute-force scan with vec_distance_cosine() over a join, NOT
+  sqlite-vec's `MATCH ... k = ?`. The KNN form cannot be combined with the
+  project and source-selection joins, and exhaustive is what the schema was
+  designed around anyway (the 50k-chunk estimate in migrations.py). Both callers
+  (retrieval _specific, projection search) use the same shape, so there is one
+  way this works rather than two.
+- Chunk inserts are one row at a time inside the transaction, not executemany:
+  the vector lives in chunk_vectors keyed by the chunk's integer `seq`, and
+  lastrowid is the only way to learn a fresh seq. In-process, so it costs nothing.
+- FTS5 MATCH takes a query *language*, not a literal. Free user text containing a
+  quote, a `*`, or the word NEAR is a syntax error -> a 500 on the search
+  endpoint. plainto_tsquery absorbed that for us; _fts_query() now does.
+- conn.execute() returns a cursor, so the three places that parsed asyncpg's
+  "UPDATE 3" status tag via result.split()[-1] now read cursor.rowcount.
+- clear_studied tests json_extract(study_status,'$.state') IS NOT NULL rather
+  than <> '{}': study_status is TEXT, so two equal JSON objects can still differ
+  as strings (key order, whitespace).
+
+ZERO-PADDING (the phase 1 item that is a behaviour change, not a syntax one)
+- _next_child_path returned str(n+1). Both ltree and TEXT compare labels
+  lexicographically, so '10' sorted before '2' and ORDER BY path scrambled any
+  thread that reached ten siblings. Now f"{n+1:04d}". Easy to lose, because at
+  the call site it looks like just another line to convert.
+
+VERIFIED (63 assertions, scripts/check_sqlite_port.py, all passing)
+- Real PDF (testsuite/pdfs_to_upload/02_tokens.pdf) through real local storage,
+  real parse and real chunker -> 19 chunks, 19 vectors, 19 FTS rows.
+- Re-ingest idempotent; the delete trigger reaps vectors (0 orphans).
+- UUID binding both directions; ON CONFLICT DO NOTHING RETURNING; partial UPDATE
+  with NOW(); ISO-8601 timestamps.
+- The GLOB-vs-LIKE underscore trap; descendants_of on a missing branch -> 0.
+- Zero-padded labels ordering correctly past 10 siblings; child count ignoring
+  grandchildren; ancestors_of returning the branch.
+- study monotonicity (won't downgrade active -> passive) and project scoping.
+- sweep: json_patch preserves sibling keys, rowcount correct, fresh rows untouched.
+- projections + clusters end to end; centroid stored as a 4096-byte float32 blob.
+- cosine ordering/range; bm25 ordering, empty result, and FTS5 metacharacters.
+- Cascade delete leaves 0 rows in every table, incl. chunk_vectors and chunks_fts.
+
+STATE / NOT DONE
+- Every SQL statement in the app is SQLite and verified. The app still does not
+  *start*, for reasons outside phase 1: main.py's lifespan calls
+  create_redis_pool() (phase 2), and config.py still _required()s POSTGRES_URL
+  and REDIS_PUBLIC_URL (phase 4) — both now dead settings that nothing reads.
+- Phase 3 (local storage) landed in parallel; the only file both touched was
+  config.py, without conflict.
+
+================================================================================
+2026-08-28 — Phase 2: Redis/ARQ replaced by a jobs table in SQLite
+
+WHAT
+- app/producer.py: the ARQ redis pool is gone; enqueue() is an INSERT into the
+  `jobs` table. enqueue_ingest / enqueue_projections / enqueue_clusters /
+  enqueue_finalize keep their names and signatures, so documents.py did not change.
+- app/worker.py: WorkerSettings/RedisSettings deleted, replaced by _claim(),
+  run_job(), run_worker() and a _serve() process wrapper. `python -m app.worker`
+  now runs the loop (which is what COMMANDS_TO_START.txt always claimed it did);
+  the old ad-hoc ingest harness moved to `python -m app.worker ingest [doc_id]`.
+- The ARQ `ctx` first parameter dropped from all five job functions. It existed
+  only to carry the redis handle — finalize_project re-enqueues via producer now.
+- main.py lifespan: create_redis_pool/close_redis_pool gone. Jobs are rows in the
+  same database, so create_pool() already covers them.
+- requirements.txt: arq dropped.
+- NO schema change: the `jobs` table shipped in migration v1 back in phase 1.
+
+WHY POLLING IS FINE
+- Redis could block until a job arrived; a table has to be polled. That is the
+  one thing this trade actually costs. At 0.25s idle sleep the added latency is
+  imperceptible next to the upload it follows, and an idle indexed SELECT is far
+  too cheap to matter on a laptop. What it buys: no second server to install,
+  supervise, or explain, and the queue lives inside the one file that "back up
+  your data" already covers.
+
+TWO BUGS THE HARNESS CAUGHT IN MY OWN CODE (both fixed)
+- _MAX_ATTEMPTS ran jobs 4 times, not 3. _claim() SELECTs `attempts` and then
+  UPDATEs it in the same transaction, so the value handed to run_job was the
+  pre-increment one and the first run looked like attempt 0. _claim now returns
+  `attempts + 1 AS attempt` — the count including this claim.
+- run_worker() originally called create_pool()/close_pool() itself. That made the
+  loop un-embeddable: cancelling it closed the shared connection out from under
+  the caller, which is exactly what the test harness does (and what any future
+  supervisor would do). The loop now assumes an open database; _serve() owns the
+  process lifecycle. Better layering, not just a test fix.
+
+DESIGN NOTES
+- Claim is SELECT ... LIMIT 1 plus a guarded UPDATE inside one transaction.
+  Only one worker is expected, but nothing stops a user launching a second copy
+  of the app, and BEGIN IMMEDIATE + `WHERE state='queued'` makes the loser of
+  that race see rowcount 0 and move on rather than run the job twice.
+- Jobs are processed one at a time (ARQ had max_jobs=10). Simpler, and the writes
+  serialise in SQLite anyway; _IDLE_SLEEP_SECONDS and the loop are trivial to
+  raise later if batch ingest feels slow.
+- Retries: 3 attempts with a 10s backoff, because the likely failure is a network
+  blip mid-embed rather than a bad PDF. An unknown func name fails the job
+  instead of resolving to an arbitrary attribute of the module — JOBS is both the
+  dispatch table and the allowlist.
+- finalize_project's _FINALIZE_MAX_ATTEMPTS ceiling is not "give up on the batch",
+  it is "stop waiting and recompute anyway", so one document stuck mid-parse
+  can't hold the project's map hostage forever. Documented it in place; the old
+  comment there was an unanswered question about exactly this.
+
+VERIFIED (38 assertions, scripts/check_job_queue.py, all passing)
+- enqueue shape: state/func/args/attempts, UUID args stringified.
+- claim: FIFO by id, marks running, increments attempts, empty queue -> None,
+  running rows not re-claimable.
+- run_after: deferred job invisible until due, then claimable.
+- dispatch: args passed positionally, success -> done, failure -> requeued with
+  backoff then error at the cap, unknown func -> error not crash.
+- finalize_project: re-enqueues itself deferred with attempts_left decremented,
+  enqueues both recomputes once documents are terminal, and recomputes anyway
+  when attempts_left hits 0.
+- End to end through the REAL loop: producer.enqueue_ingest + enqueue_finalize,
+  run_worker() as a task, real PDF -> 19 chunks, 19 projections, 4 jobs done,
+  0 errored, pipeline order ingest -> finalize -> projections -> clusters.
+- scripts/check_sqlite_port.py still 63/63 after the ctx removal.
+
+THE APP STARTS (first time since the port began)
+- uvicorn app.main:app boots, /healthz 200s.
+- Real HTTP round trip: register -> create project -> upload PDF -> file on local
+  disk, both job rows queued by the WEB process and read back from a SEPARATE
+  process. Deliberately did not run the worker over HTTP: that spends real money
+  on embeddings.
+- Test rows cleaned out of devdata afterwards.
+
+STATE / NOT DONE
+- config.py still _required()s POSTGRES_URL and REDIS_PUBLIC_URL. Both are dead
+  settings that nothing imports; deleting them belongs to phase 4, which is being
+  done in parallel and owns that file.
+- Crash recovery (jobs left 'running' by a killed worker) is untouched — that is
+  explicitly a phase 8 item. Nothing requeues them today.
+
+================================================================================
+2026-08-28 — Phase 7 freeze spike + phase 2 fallout + crash recovery
+
+THE SPIKE: IT WORKS. 277 MB, 5/5 native deps
+- packaging/f7ows-backend.spec + packaging/launcher.py (new).
+      cd backend && pyinstaller packaging/f7ows-backend.spec --noconfirm
+- The TODO expected pain from numba/llvmlite. There wasn't any: the frozen
+  binary JITs and runs a real UMAP fit. `f7ows-backend selftest` checks all five
+  native payloads (sqlite-vec vec0.dll, numba JIT, UMAP, pypdfium2 pdfium.dll,
+  keyring backend) -> 5/5. That mode doubles as phase 7's first-run health check.
+- Frozen `serve` boots and answers /healthz (creates its data dir + migrates on
+  first run). Frozen `worker` claims and completes real jobs.
+- One binary, two roles (serve/worker) instead of two exes: PyInstaller would
+  otherwise duplicate the runtime + numpy + sklearn + llvmlite into each.
+- Size: llvmlite 115 MB, scipy 47 MB, numpy.libs 21 MB, scipy.libs 20 MB,
+  sklearn 13 MB, pypdfium2 7 MB. llvmlite alone is 42% of the bundle — if the
+  installer ever needs to be smaller, dropping UMAP (keeping PCA/t-SNE) is the
+  one change that would actually move the number.
+
+TWO TRAPS — silent at build time, fatal at startup
+- uvicorn.run("app.main:app") passes the app as a STRING. PyInstaller's static
+  analysis never sees the `app` package, so it builds a bundle with our own code
+  missing and the exe dies with ModuleNotFoundError: app. The launcher imports
+  the app object instead. Same class of problem as any string-resolved import.
+- pathex=[".."] resolves against the CALLER's working directory, not the spec's.
+  It silently collected nothing. Fixed with SPECPATH, and the spec now asserts
+  app.main actually landed in hiddenimports — so a regression fails the build
+  instead of shipping a broken bundle.
+- Also: hiddenimports += collect_submodules("app"), because worker.py imports
+  app.projections.compute and app.clusters lazily inside the recompute jobs. A
+  missing one of those would crash mid-ingest, not at startup.
+
+DEPENDENCY AUDIT (the reason the bundle is 277 MB and not ~1 GB)
+- requirements.txt did not describe the app. pypdfium2 was missing entirely --
+  and that is the parse path the app actually RUNS (parse() defaults to
+  use_models=False and nothing passes True). A fresh `pip install -r
+  requirements.txt` produced an app that ImportError'd on the first upload.
+  Added it, plus numpy (imported directly by worker/clusters/projections).
+- docling deliberately NOT a requirement, and excluded in the spec. `docling`
+  resolves to docling-slim[standard] -> docling-ibm-models -> torch +
+  torchvision + transformers + accelerate. torch alone is 528 MB installed.
+  Bare docling-slim needs only pydantic/requests/tqdm-scale packages; it is the
+  [standard] extra that carries the ML stack. Nothing in the app reaches the
+  docling path today, so it stays an opt-in install (documented in
+  requirements.txt).
+- The spike built from a CLEAN venv off requirements.txt (464 MB, no torch, no
+  docling) rather than the dev venv. Two reasons: it measures the real installer
+  size instead of the dev venv's history, and it does not disturb a venv another
+  agent is actively working in.
+- Did NOT prune the dev venv: it is shared, phase 4 was mid-flight in it, and
+  the audit's "not in the dependency closure" is not the same as "unused" --
+  uvicorn appears there only because nothing `import`s it (it is the CLI entry
+  point). Blindly uninstalling would have broken the app. Genuinely dead in the
+  dev venv, for whenever it is convenient: asyncpg, psycopg/psycopg-binary,
+  sqlalchemy, alembic, boto3/botocore/s3transfer, and the whole torch/docling
+  stack (~800 MB). tiktoken is NOT dead -- app/tokens.py's calibration harness
+  wants it, dev-only and deliberately absent from requirements.
+
+PHASE 2 FALLOUT I MISSED (testsuite/ is outside app/, so my greps missed it)
+- testsuite/procs.py spawned `python -m arq app.worker.WorkerSettings`. Now
+  `python -m app.worker`.
+- testsuite/__main__.py flushed the ARQ redis queue on `clean`; now deletes from
+  the jobs table on the connection it already has.
+- testsuite/__main__.py still had $1/$2 placeholders — including one query that
+  uses $1 THREE times, which is exactly the case app/db.py's docstring warned a
+  regex conversion would break. Positional params have to be repeated.
+- Same file's `res.split()` on an asyncpg status tag -> cursor.rowcount.
+
+CRASH RECOVERY (phase 8, but really a phase 2 regression)
+- worker.requeue_stranded(), called at run_worker() startup: any row still
+  `running` when the loop starts was abandoned by a dead process, because a job
+  only leaves `running` when it finishes.
+- This was not polish. ARQ released a dead worker's lock and the job became
+  claimable again; the jobs table has no lease and _claim only looks at `queued`,
+  so a force-quit mid-ingest left the document at "parsing" in the UI FOREVER
+  with nothing able to pick it up. Laptops force-quit constantly.
+- Attempts are deliberately not reset: a job that reliably kills the process
+  still exhausts its retries rather than looping forever.
+
+VERIFIED
+- scripts/check_job_queue.py 47/47 (was 38; +9 for crash recovery incl. that
+  stranded rows are invisible to _claim, attempts survive, and requeue only ever
+  touches `running`).
+- scripts/check_sqlite_port.py still 63/63.
+- Frozen bundle: selftest 5/5, serve -> /healthz 200, worker -> 2 jobs done.
+
+STATE / NOT DONE
+- The in-app opt-in Docling download (and wiring use_models=True) is still open;
+  only the exclusion side is done.
+- Frozen `serve` currently still picks up backend/.env via config.py's
+  load_dotenv(). An installed copy has no .env — that is phase 4's territory and
+  it is being handled there.
+- build/ and dist/ are now gitignored; the spec and launcher are tracked.

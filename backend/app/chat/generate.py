@@ -81,5 +81,6 @@ async def grounded_answer(
     answer = await complete(
         messages, model=model or prefs.chat_model, max_tokens=max_tokens or prefs.max_tokens,
         temperature=prefs.temperature, top_p=prefs.top_p, top_k=prefs.top_k,
+        role="chat",
     )
     return GroundedAnswer(answer, retrieval)

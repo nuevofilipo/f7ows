@@ -1,9 +1,11 @@
 """
-LLM chat helper — a thin async wrapper over the OpenRouter chat-completions API.
+LLM chat helper — a thin async wrapper over an OpenAI-compatible
+chat-completions API.
 
-Mirrors embed.py: raw httpx, one key, base URL/model from settings. Used so far
-only by the retrieval router's "planner" step, but kept general (and reusable by
-the future chat/slash-command features).
+Mirrors embed.py: raw httpx, with the endpoint and credential resolved per
+*role* (:mod:`app.providers`). The role decides where the call goes, so the cheap
+planner can run against a local Ollama while chat stays on a frontier model,
+without either call site knowing anything about providers.
 """
 from __future__ import annotations
 
@@ -11,8 +13,7 @@ import logging
 
 import httpx
 
-from app import apikey, cost
-from app.config import settings
+from app import cost, providers
 
 logger = logging.getLogger(__name__)
 
@@ -30,16 +31,25 @@ async def complete(
     top_p: float | None = None,
     top_k: int | None = None,
     timeout: float = 60.0,
+    role: str = "planner",
 ) -> str:
-    """Run a chat completion and return the assistant's text content."""
-    url = f"{settings.llm_base_url.rstrip('/')}/chat/completions"
+    """Run a chat completion and return the assistant's text content.
+
+    ``role`` selects the provider — "planner" by default, since the cheap
+    classifier calls are exactly the ones that omit it. ``model`` still wins over
+    the role's configured model, which is how the user's chat-model picker works.
+    """
+    provider = providers.for_role(role)
+    url = provider.url("/chat/completions")
     payload = {
-        "model": model or settings.planner_model,
+        "model": model or provider.model,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
         # Ask OpenRouter to return the real dollar cost of this generation in the
         # response `usage.cost`, which we accumulate per request (see app.cost).
+        # Other providers ignore the field and report nothing; app.cost counts
+        # those calls as unpriced rather than pretending they were free.
         "usage": {"include": True},
     }
     # Optional sampling controls — only sent when set (top_k=0 means "off").
@@ -47,7 +57,7 @@ async def complete(
         payload["top_p"] = top_p
     if top_k:
         payload["top_k"] = top_k
-    headers = {"Authorization": f"Bearer {apikey.current_key()}"}
+    headers = provider.auth_header()
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(url, json=payload, headers=headers)
@@ -68,11 +78,16 @@ async def complete(
 
 
 async def list_models(*, timeout: float = 15.0) -> list[dict]:
-    """Fetch the catalogue of models available on the gateway (OpenRouter's
-    ``/models``). Returns the raw ``data`` list; the caller trims it. The key is
-    sent for consistency/BYOK context even though the endpoint is public."""
-    url = f"{settings.llm_base_url.rstrip('/')}/models"
-    headers = {"Authorization": f"Bearer {apikey.current_key()}"}
+    """Fetch the catalogue of models available on the gateway (the OpenAI-shaped
+    ``/models``). Returns the raw ``data`` list; the caller trims it.
+
+    Asks the *chat* role's provider, since this feeds the chat model picker — on
+    a local Ollama that correctly lists the models pulled on this machine rather
+    than OpenRouter's catalogue.
+    """
+    provider = providers.for_role("chat")
+    url = provider.url("/models")
+    headers = provider.auth_header()
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.get(url, headers=headers)

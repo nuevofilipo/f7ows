@@ -1,12 +1,19 @@
 """
-Embedding — turn chunk text into dense vectors for pgvector retrieval.
+Embedding — turn chunk text into dense vectors for sqlite-vec retrieval.
 
-One async entry point, ``embed(texts) -> list[vector]``, returning a 3072-dim
-float vector per input (OpenAI ``text-embedding-3-large``, stored as
-``halfvec(3072)``). We call it through OpenRouter's OpenAI-compatible
-``/embeddings`` route by default so every model call uses the same key; set
-``EMBED_BASE_URL`` to ``https://api.openai.com/v1`` to talk to OpenAI directly if
-the gateway doesn't proxy embeddings.
+One async entry point, ``embed(texts) -> list[vector]``, returning an
+``EMBED_DIM``-wide float vector per input (OpenAI ``text-embedding-3-large``,
+truncated by the API's ``dimensions`` parameter). We call it through
+OpenRouter's OpenAI-compatible
+``/embeddings`` route by default so every model call uses the same key. The
+endpoint is configurable per role (:mod:`app.providers`) — point the embed role
+at ``https://api.openai.com/v1`` to talk to OpenAI directly if the gateway
+doesn't proxy embeddings.
+
+Changing the embed *model* is not a free switch: vectors from two models are not
+comparable and the schema fixes the width, so an existing project would need
+re-embedding. That is the deferred work in TODO_desktop.md phase 5, not something
+this setting does for you.
 
 Deliberately thin: raw httpx (already a dependency) instead of the OpenAI SDK,
 input batched to keep request count low, oversized inputs token-truncated to the
@@ -28,15 +35,26 @@ if __package__ in (None, ""):
 
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
-from app import apikey
-from app.config import settings
+from app import providers, tokens
+from app.migrations import EMBED_DIM
 
 logger = logging.getLogger(__name__)
 
-EMBED_DIM = 3072            # text-embedding-3-large native dimensionality
+# Vector width. Owned by app/migrations.py because the schema is the binding
+# constraint (a vec0 column's dimension is fixed when the table is created), and
+# a mismatch here would write vectors the database cannot store.
+# text-embedding-3-large is natively 3072 but Matryoshka-trained, so asking the
+# API for 1024 via `dimensions` truncates *and re-normalises* server-side, at a
+# quality cost of ~1-2% MTEB. Worth it: sqlite-vec has no float16, so 1024
+# float32 is 4KB/vector against 12KB at 3072 — a third of the disk and a third
+# of every brute-force scan.
 
 _BATCH_SIZE = 96           # inputs per request — well under provider array limits
-_MAX_INPUT_TOKENS = 8000   # model hard cap is ~8192; leave headroom
+# Model hard cap is ~8192. The headroom absorbs the token estimate's error: the
+# estimate is a corpus mean, and LaTeX-dense text tokenizes ~10% worse than that,
+# so 8000 could still land over the cap and get the whole batch rejected. Only
+# pathological inputs are clipped at all, so the spare 1200 costs us nothing.
+_MAX_INPUT_TOKENS = 7000
 _MAX_RETRIES = 4
 _TIMEOUT = httpx.Timeout(60.0)
 
@@ -45,36 +63,23 @@ class EmbedError(RuntimeError):
     """Raised when the embedding endpoint fails or returns an unexpected shape."""
 
 
-# Lazy tiktoken encoder, shared, only built if we actually need to truncate.
-_encoder = None
-
-
 def _truncate(text: str) -> str:
     """Clip a single input to the model's token limit. A normal chunk is far
     smaller; this only bites on a pathological input (e.g. one giant equation),
     which we'd rather embed truncated than have the whole batch rejected."""
-    global _encoder
-    if _encoder is None:
-        try:
-            import tiktoken
-
-            _encoder = tiktoken.get_encoding("o200k_base")
-        except Exception:  # noqa: BLE001 - fall back to a coarse char clip
-            _encoder = False
-    if _encoder is False:
-        return text[: _MAX_INPUT_TOKENS * 4]
-    tokens = _encoder.encode(text)
-    if len(tokens) <= _MAX_INPUT_TOKENS:
-        return text
-    logger.warning("embed: truncating input from %d to %d tokens", len(tokens), _MAX_INPUT_TOKENS)
-    return _encoder.decode(tokens[:_MAX_INPUT_TOKENS])
+    clipped = tokens.clip(text, _MAX_INPUT_TOKENS)
+    if clipped is not text:
+        logger.warning("embed: truncating input from %d to %d chars (~%d tokens)",
+                       len(text), len(clipped), _MAX_INPUT_TOKENS)
+    return clipped
 
 
 async def _embed_batch(client: httpx.AsyncClient, batch: list[str]) -> list[list[float]]:
     """POST one batch, with retry/backoff, and return vectors in input order."""
-    payload = {"model": settings.embed_model, "input": batch, "dimensions": EMBED_DIM}
-    headers = {"Authorization": f"Bearer {apikey.current_key()}"}
-    url = f"{settings.embed_base_url.rstrip('/')}/embeddings"
+    provider = providers.for_role("embed")
+    payload = {"model": provider.model, "input": batch, "dimensions": EMBED_DIM}
+    headers = provider.auth_header()
+    url = provider.url("/embeddings")
 
     for attempt in range(1, _MAX_RETRIES + 1):
         try:

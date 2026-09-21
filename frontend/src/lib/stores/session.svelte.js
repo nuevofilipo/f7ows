@@ -18,6 +18,16 @@ class SessionStore {
 		return this.user !== null;
 	}
 
+	/**
+	 * True when the backend runs in single-user (desktop) mode: it seeds one local
+	 * user and auto-issues the cookie, so there is nobody to log in as and nothing
+	 * to log out to. The UI hides the account controls rather than offering a
+	 * button whose only effect is to be undone on the next request.
+	 */
+	get singleUser() {
+		return this.user?.single_user === true;
+	}
+
 	/** Load the current user once on boot; swallow 401 (just means logged out). */
 	async init() {
 		try {

@@ -3,7 +3,7 @@ Transparent execution tracing.
 
 A context-scoped :class:`Tracer` that the real backend code taps into, so that
 *any* invocation — driven by the testsuite or by a real frontend request —
-automatically drops human-readable artifacts into ``runs/runN_<kind>_<label>/``.
+automatically drops human-readable artifacts into ``<CACHE>/runs/runN_<kind>_<label>/``.
 
 Design:
 
@@ -32,10 +32,24 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from app import paths
+
 logger = logging.getLogger(__name__)
 
-# runs/ lives next to app/ (i.e. backend/runs), overridable via TRACE_DIR.
-RUNS_DIR = Path(os.getenv("TRACE_DIR") or (Path(__file__).resolve().parent.parent / "runs"))
+def _runs_dir() -> Path:
+    """Where run directories go: the app cache dir (``<CACHE>/runs``), or
+    ``TRACE_DIR`` when set.
+
+    Resolved per call rather than at import: ``paths.runs_dir()`` creates the
+    directory, and merely importing this module — which every request path does,
+    tracing on or off — must not litter the filesystem.
+    """
+    override = os.getenv("TRACE_DIR")
+    if override:
+        d = Path(override).expanduser()
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    return paths.runs_dir()
 
 _current: ContextVar["Tracer | None"] = ContextVar("current_trace", default=None)
 
@@ -141,10 +155,10 @@ def current_run() -> "Tracer | _NullTracer":
 
 
 def _next_run_dir(kind: str, label: str | None) -> Path:
-    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    runs = _runs_dir()
     nums = [
         int(m.group(1))
-        for d in RUNS_DIR.iterdir()
+        for d in runs.iterdir()
         if d.is_dir() and (m := re.match(r"run(\d+)_", d.name))
     ]
     n = (max(nums) + 1) if nums else 1
@@ -152,7 +166,7 @@ def _next_run_dir(kind: str, label: str | None) -> Path:
     while True:
         name = f"run{n}_{kind}" + (f"_{suffix}" if suffix else "")
         try:
-            path = RUNS_DIR / name
+            path = runs / name
             path.mkdir()  # exclusive: raises if another process took this number
             return path
         except FileExistsError:
@@ -185,7 +199,7 @@ def project_artifact(project_id, name: str, text: str) -> None:
     single run. No-op when tracing is disabled."""
     if not _enabled():
         return
-    pdir = RUNS_DIR / f"project_{str(project_id)[:8]}"
+    pdir = _runs_dir() / f"project_{str(project_id)[:8]}"
     pdir.mkdir(parents=True, exist_ok=True)
     (pdir / name).write_text(text, encoding="utf-8")
 

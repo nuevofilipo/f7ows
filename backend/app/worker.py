@@ -1,23 +1,28 @@
 """
-ARQ worker — background job definitions and WorkerSettings.
+Background worker — the job functions, and the loop that runs them.
 
 Run with:
-    arq app.worker.WorkerSettings
+    python -m app.worker
+
+The queue is the `jobs` table (app/migrations.py), not Redis; app/producer.py is
+the enqueueing half. This process claims one job at a time, runs it, and marks it
+done or failed.
+
+Two processes, deliberately, exactly as before: the web app must not run these.
+Parsing a PDF and fitting UMAP are second-to-minute CPU work, and inside the API
+process they would stall every request — including the status polls the UI uses
+to render ingest progress.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-from datetime import timedelta
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from arq.connections import RedisSettings
-
-from app import apikey
+from app import producer
 from app.chunk.chunk import chunk as chunk_markdown
-from app.config import settings
-from app.db import acquire, create_pool, close_pool
+from app.db import NOW, acquire, close_pool, create_pool, placeholders, serialize_vector
 from app.embed.embed import embed
 from app.ingest.parse import parse
 from app.library import storage
@@ -52,11 +57,11 @@ def _render_embeddings(chunks, embeddings) -> str:
 
 
 async def _set_status(document_id: UUID, state: str, **extra) -> None:
-    """Write the document's ingestion state (JSONB) — the UI polls this."""
+    """Write the document's ingestion state (JSON) — the UI polls this."""
     async with acquire() as conn:
         await conn.execute(
-            "UPDATE documents SET status = $2::jsonb WHERE id = $1",
-            document_id, json.dumps({"state": state, **extra}),
+            "UPDATE documents SET status = ? WHERE id = ?",
+            json.dumps({"state": state, **extra}), document_id,
         )
 
 
@@ -64,7 +69,7 @@ async def _set_status(document_id: UUID, state: str, **extra) -> None:
 # Job functions
 # ---------------------------------------------------------------------------
 
-async def ingest_document(ctx: dict, document_id: str) -> dict:
+async def ingest_document(document_id: str) -> dict:
     """
     Full ingestion pipeline for a single document (PHASE4_PLAN_v2 §1):
     download PDF -> parse -> chunk -> embed -> insert chunks -> mark ready.
@@ -72,7 +77,7 @@ async def ingest_document(ctx: dict, document_id: str) -> dict:
     parse() and chunk() are CPU-bound and synchronous, so they run in a
     threadpool to avoid blocking the worker's event loop. On any failure the
     document is marked "error" with the message and the exception re-raised so
-    ARQ records the job as failed.
+    the loop records the job as failed.
     """
     doc_id = UUID(str(document_id))
     logger.info("ingest_document: %s", doc_id)
@@ -80,11 +85,9 @@ async def ingest_document(ctx: dict, document_id: str) -> dict:
         async with acquire() as conn:
             doc = await conn.fetchrow(
                 """
-                SELECT d.name, d.storage_key, d.project_id, u.openrouter_key
+                SELECT d.name, d.storage_key, d.project_id
                 FROM documents d
-                JOIN projects p ON p.id = d.project_id
-                JOIN users u ON u.id = p.user_id
-                WHERE d.id = $1
+                WHERE d.id = ?
                 """,
                 doc_id,
             )
@@ -110,31 +113,41 @@ async def ingest_document(ctx: dict, document_id: str) -> dict:
             tr.set(chunks=len(chunks))
 
             await _set_status(doc_id, "embedding", chunks=len(chunks))
-            # Embed with the document owner's BYOK key (falls back to the global key).
-            with tr.timer("embed"), apikey.using_encrypted(doc["openrouter_key"]):
+            # The endpoint and key come from the embed role's provider at call
+            # time (app/providers.py); nothing is threaded through the job.
+            with tr.timer("embed"):
                 embeddings = await embed([c.content_full for c in chunks])
             tr.write("02_embedded.md", _render_embeddings(chunks, embeddings))
 
-            rows = [
-                (
-                    doc_id, c.chunk_index, c.content_full, c.content_sparse, emb, c.path,
-                    json.dumps({"heading_trail": c.heading_trail, "token_count": c.token_count}),
-                )
-                for c, emb in zip(chunks, embeddings)
-            ]
             async with acquire() as conn:
                 async with conn.transaction():
-                    # Idempotent re-ingest: clear any prior chunks for this document.
-                    await conn.execute("DELETE FROM chunks WHERE document_id = $1", doc_id)
-                    await conn.executemany(
-                        """
-                        INSERT INTO chunks
-                            (document_id, chunk_index, content_full, content_sparse,
-                             embedding, path, metadata)
-                        VALUES ($1, $2, $3, $4, $5, $6::ltree, $7::jsonb)
-                        """,
-                        rows,
-                    )
+                    # Idempotent re-ingest: clear any prior chunks for this
+                    # document. The chunks_after_delete trigger reaps their
+                    # vectors and FTS rows, which no foreign key would reach:
+                    # chunk_vectors and chunks_fts are virtual tables.
+                    await conn.execute("DELETE FROM chunks WHERE document_id = ?", doc_id)
+                    # One row at a time rather than executemany: the vector lives
+                    # in a separate table keyed by the chunk's integer `seq`, and
+                    # the only way to learn a freshly inserted seq is lastrowid on
+                    # that statement's own cursor. Still one transaction, still
+                    # in-process, so the extra round trips cost nothing measurable.
+                    for c, emb in zip(chunks, embeddings):
+                        cursor = await conn.execute(
+                            """
+                            INSERT INTO chunks
+                                (id, document_id, chunk_index, content_full,
+                                 content_sparse, path, metadata)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            uuid4(), doc_id, c.chunk_index, c.content_full,
+                            c.content_sparse, c.path,
+                            json.dumps({"heading_trail": c.heading_trail,
+                                        "token_count": c.token_count}),
+                        )
+                        await conn.execute(
+                            "INSERT INTO chunk_vectors (chunk_seq, embedding) VALUES (?, ?)",
+                            cursor.lastrowid, serialize_vector(emb),
+                        )
 
             await _set_status(doc_id, "ready", chunks=len(chunks))
             # NOTE: projections/clusters are intentionally NOT enqueued here. A new
@@ -145,16 +158,16 @@ async def ingest_document(ctx: dict, document_id: str) -> dict:
             logger.info("ingest_document: %s ready (%d chunks)", doc_id, len(chunks))
             return {"status": "ok", "document_id": str(doc_id), "chunks": len(chunks)}
 
-    except Exception as exc:  # noqa: BLE001 - record on the doc, then re-raise for ARQ
+    except Exception as exc:  # noqa: BLE001 - record on the doc, then re-raise for the loop
         logger.exception("ingest_document failed: %s", doc_id)
         await _set_status(doc_id, "error", error=str(exc))
         raise
 
 
-async def generate_apkg(ctx: dict, artifact_id: str) -> dict:
+async def generate_apkg(artifact_id: str) -> dict:
     """
-    Generate an Anki .apkg file from a set of flashcards stored in Postgres,
-    upload to R2, update the artifact row with the storage key.
+    Generate an Anki .apkg file from a set of flashcards stored in the database,
+    write it to local storage, update the artifact row with the storage key.
     """
     logger.info("generate_apkg: artifact_id=%s", artifact_id)
     # TODO: implement
@@ -169,7 +182,7 @@ def _coord_json(arr, i: int, keys: tuple[str, ...]) -> str | None:
     return json.dumps({k: float(arr[i][j]) for j, k in enumerate(keys)})
 
 
-async def recalculate_projections(ctx: dict, project_id: str) -> dict:
+async def recalculate_projections(project_id: str) -> dict:
     """
     Recompute display coordinates for an entire project: pull every chunk's
     embedding, reduce the whole matrix (UMAP 2D+3D, PCA, t-SNE), and write the
@@ -177,7 +190,7 @@ async def recalculate_projections(ctx: dict, project_id: str) -> dict:
     every point, so the whole map is recomputed (PHASE4_PLAN_v2 §1 / PRD).
 
     CPU-heavy; reduction runs in a threadpool. Coordinates land in the existing
-    JSONB columns and are null until this completes (the UI treats null as
+    JSON columns and are null until this completes (the UI treats null as
     "not plotted yet").
     """
     import numpy as np
@@ -190,10 +203,11 @@ async def recalculate_projections(ctx: dict, project_id: str) -> dict:
     async with acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT c.id, c.embedding
+            SELECT c.id, v.embedding
             FROM chunks c
+            JOIN chunk_vectors v ON v.chunk_seq = c.seq
             JOIN documents d ON d.id = c.document_id
-            WHERE d.project_id = $1 AND c.embedding IS NOT NULL
+            WHERE d.project_id = ?
             ORDER BY c.id
             """,
             pid,
@@ -202,16 +216,22 @@ async def recalculate_projections(ctx: dict, project_id: str) -> dict:
         return {"status": "ok", "project_id": str(pid), "chunks": 0}
 
     ids = [r["id"] for r in rows]
-    vectors = np.array([r["embedding"].to_numpy() for r in rows], dtype=np.float32)
+    # sqlite-vec hands the column back as the raw little-endian float32 blob it
+    # stores, so numpy reads it directly (pgvector returned its own type, with a
+    # .to_numpy() to get here).
+    vectors = np.array([np.frombuffer(r["embedding"], dtype=np.float32) for r in rows],
+                       dtype=np.float32)
     coords = await asyncio.to_thread(compute, vectors)
 
+    # id last: placeholders are positional now, so each tuple has to follow the
+    # statement's SET-then-WHERE order rather than asyncpg's $1-first.
     updates = [
         (
-            cid,
             _coord_json(coords["umap_2d"], i, ("x", "y")),
             _coord_json(coords["umap_3d"], i, ("x", "y", "z")),
             _coord_json(coords["pca"], i, ("x", "y")),
             _coord_json(coords["tsne"], i, ("x", "y")),
+            cid,
         )
         for i, cid in enumerate(ids)
     ]
@@ -219,9 +239,8 @@ async def recalculate_projections(ctx: dict, project_id: str) -> dict:
         await conn.executemany(
             """
             UPDATE chunks
-            SET umap_2d = $2::jsonb, umap_3d = $3::jsonb,
-                pca_coords = $4::jsonb, tsne_coords = $5::jsonb
-            WHERE id = $1
+            SET umap_2d = ?, umap_3d = ?, pca_coords = ?, tsne_coords = ?
+            WHERE id = ?
             """,
             updates,
         )
@@ -235,7 +254,7 @@ async def recalculate_projections(ctx: dict, project_id: str) -> dict:
     return {"status": "ok", "project_id": str(pid), "chunks": len(ids)}
 
 
-async def recalculate_clusters(ctx: dict, project_id: str) -> dict:
+async def recalculate_clusters(project_id: str) -> dict:
     """
     Recompute the project's semantic clusters (single level for now): pull every
     chunk's embedding + sparse text, run HDBSCAN, and replace the project's rows
@@ -252,10 +271,11 @@ async def recalculate_clusters(ctx: dict, project_id: str) -> dict:
     async with acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT c.id, c.embedding, c.content_sparse
+            SELECT c.id, v.embedding, c.content_sparse
             FROM chunks c
+            JOIN chunk_vectors v ON v.chunk_seq = c.seq
             JOIN documents d ON d.id = c.document_id
-            WHERE d.project_id = $1 AND c.embedding IS NOT NULL
+            WHERE d.project_id = ?
             ORDER BY c.id
             """,
             pid,
@@ -264,20 +284,28 @@ async def recalculate_clusters(ctx: dict, project_id: str) -> dict:
         return {"status": "ok", "project_id": str(pid), "clusters": 0}
 
     ids = [r["id"] for r in rows]
-    vectors = np.array([r["embedding"].to_numpy() for r in rows], dtype=np.float32)
+    vectors = np.array([np.frombuffer(r["embedding"], dtype=np.float32) for r in rows],
+                       dtype=np.float32)
     sparse = [r["content_sparse"] or "" for r in rows]
     results = await asyncio.to_thread(compute_clusters, vectors, sparse)
 
     async with acquire() as conn:
         async with conn.transaction():
-            await conn.execute("DELETE FROM clusters WHERE project_id = $1", pid)
+            await conn.execute("DELETE FROM clusters WHERE project_id = ?", pid)
             await conn.executemany(
                 """
                 INSERT INTO clusters
-                    (project_id, parent_id, level, label, centroid, medoid_chunk_id, member_count)
-                VALUES ($1, NULL, 0, $2, $3, $4, $5)
+                    (id, project_id, parent_id, level, label, centroid,
+                     medoid_chunk_id, member_count)
+                VALUES (?, ?, NULL, 0, ?, ?, ?, ?)
                 """,
-                [(pid, r.label, r.centroid, ids[r.medoid_index], r.member_count) for r in results],
+                # centroid is stored as a plain float32 blob, not a vec0 row:
+                # nothing searches clusters by similarity (the medoid strategy
+                # retrieves through medoid_chunk_id), so it needs no index. Same
+                # packing as a vector, hence the same helper.
+                [(uuid4(), pid, r.label, serialize_vector(r.centroid),
+                  ids[r.medoid_index], r.member_count)
+                 for r in results],
             )
 
     md = [f"# Clusters ({len(results)})\n",
@@ -290,13 +318,17 @@ async def recalculate_clusters(ctx: dict, project_id: str) -> dict:
 
 
 # Coalescing recompute: how long/often finalize_project waits for ingests.
-# but what do you mean it only waits that long, doesn't it need to wait forever, because at any point the job might arrive?
-_FINALIZE_RETRY = timedelta(seconds=5)
+# The ceiling is not "give up on the batch" — it is "stop waiting and recompute
+# anyway". A document that never reaches a terminal state (worker killed
+# mid-parse, say) would otherwise hold the project's map hostage forever, so
+# after ~10 minutes we project and cluster whatever did land. The next upload
+# enqueues another finalize and the map catches up.
+_FINALIZE_RETRY_SECONDS = 5
 _FINALIZE_MAX_ATTEMPTS = 120  # ~10 min ceiling before recomputing anyway
 
 
 async def finalize_project(
-    ctx: dict, project_id: str, document_ids: list[str],
+    project_id: str, document_ids: list[str],
     attempts_left: int = _FINALIZE_MAX_ATTEMPTS,
 ) -> dict:
     """
@@ -307,80 +339,221 @@ async def finalize_project(
     single finalize_project for the batch; it waits until all of ``document_ids``
     reach a terminal state ("ready"/"error") and only then enqueues the two
     recompute jobs. Waiting is cooperative — if documents are still ingesting it
-    re-enqueues itself deferred (freeing the worker slot) rather than sleeping.
+    re-enqueues itself with a ``run_after`` a few seconds out (freeing the worker)
+    rather than sleeping, which is what ARQ's ``_defer_by`` used to do.
     """
     pid = UUID(str(project_id))
     ids = [UUID(str(d)) for d in document_ids]
     async with acquire() as conn:
         pending = await conn.fetchval(
-            """
+            f"""
             SELECT COUNT(*) FROM documents
-            WHERE id = ANY($1::uuid[])
-              AND COALESCE(status->>'state', '') NOT IN ('ready', 'error')
+            WHERE id IN ({placeholders(ids)})
+              AND COALESCE(json_extract(status, '$.state'), '') NOT IN ('ready', 'error')
             """,
-            ids,
+            *ids,
         )
 
-    redis = ctx.get("redis")
     if pending and attempts_left > 0:
-        if redis is not None:
-            await redis.enqueue_job(
-                "finalize_project", str(pid), [str(i) for i in ids], attempts_left - 1,
-                _defer_by=_FINALIZE_RETRY,
-            )
+        await producer.enqueue_finalize(
+            pid, ids, attempts_left=attempts_left - 1,
+            delay_seconds=_FINALIZE_RETRY_SECONDS,
+        )
         return {"status": "waiting", "project_id": str(pid), "pending": int(pending)}
 
-    if redis is not None:
-        await redis.enqueue_job("recalculate_projections", str(pid))
-        await redis.enqueue_job("recalculate_clusters", str(pid))
+    await producer.enqueue_projections(pid)
+    await producer.enqueue_clusters(pid)
     logger.info("finalize_project: %s recompute enqueued (%d docs)", pid, len(ids))
     return {"status": "finalized", "project_id": str(pid), "documents": len(ids)}
 
 
 # ---------------------------------------------------------------------------
-# Worker lifecycle hooks
+# The loop
 # ---------------------------------------------------------------------------
 
-async def startup(ctx: dict) -> None:
-    ctx["pool"] = await create_pool()
-    logger.info("ARQ worker: database pool created")
+# The dispatch table. A job row stores its function by name, so this is also the
+# allowlist: a name that isn't here fails the job instead of resolving to some
+# arbitrary attribute of this module.
+JOBS = {
+    "ingest_document": ingest_document,
+    "generate_apkg": generate_apkg,
+    "recalculate_projections": recalculate_projections,
+    "recalculate_clusters": recalculate_clusters,
+    "finalize_project": finalize_project,
+}
+
+# How long to wait before looking again when the queue is empty. Redis could
+# block until a job arrived; polling is the price of not shipping Redis. A
+# quarter second is imperceptible next to the upload it follows, and an idle
+# SELECT against a warm index is far too cheap to matter on a laptop.
+_IDLE_SLEEP_SECONDS = 0.25
+
+# A failed job is retried, because the most likely failure here is a network blip
+# mid-embed rather than a bad PDF. Deterministic failures still stop quickly.
+_MAX_ATTEMPTS = 3
+_RETRY_BACKOFF_SECONDS = 10
 
 
-async def shutdown(ctx: dict) -> None:
-    await close_pool()
-    logger.info("ARQ worker: database pool closed")
+async def _claim() -> dict | None:
+    """Take the next eligible job, or None if there is nothing to do.
+
+    ``attempt`` is the count *including* this claim — the SELECT reads the
+    counter before the UPDATE bumps it, so returning the raw column would make
+    the first run look like attempt 0 and buy one extra retry.
+
+    The SELECT and the UPDATE are one transaction so a job cannot be claimed
+    twice. That matters even though only one worker is expected to run: nothing
+    stops a user from launching a second copy of the app, and BEGIN IMMEDIATE
+    plus the `state = 'queued'` guard makes the loser of that race see zero
+    updated rows and move on rather than run the job a second time.
+    """
+    async with acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                f"""
+                SELECT id, func, args, attempts + 1 AS attempt FROM jobs
+                WHERE state = 'queued' AND run_after <= {NOW}
+                ORDER BY id
+                LIMIT 1
+                """
+            )
+            if row is None:
+                return None
+            cursor = await conn.execute(
+                f"""
+                UPDATE jobs SET state = 'running', attempts = attempts + 1,
+                                updated_at = {NOW}
+                WHERE id = ? AND state = 'queued'
+                """,
+                row["id"],
+            )
+            if cursor.rowcount != 1:
+                return None       # someone else got there first
+    return dict(row)
+
+
+async def _finish(job_id: int, state: str, error: str | None = None,
+                  delay_seconds: float = 0) -> None:
+    """Record a job's outcome: done, error, or queued again for a retry."""
+    run_after = NOW if not delay_seconds else (
+        f"strftime('%Y-%m-%dT%H:%M:%fZ','now','+{float(delay_seconds)} seconds')")
+    async with acquire() as conn:
+        await conn.execute(
+            f"""
+            UPDATE jobs SET state = ?, error = ?, updated_at = {NOW},
+                            run_after = {run_after}
+            WHERE id = ?
+            """,
+            state, error, job_id,
+        )
+
+
+async def run_job(job: dict) -> None:
+    """Run one claimed job and record what happened. Never raises: a job that
+    blows up must not take the worker down with it."""
+    func = JOBS.get(job["func"])
+    if func is None:
+        logger.error("worker: unknown job function %r (job %s)", job["func"], job["id"])
+        await _finish(job["id"], "error", f"unknown job function: {job['func']}")
+        return
+
+    args = json.loads(job["args"])
+    try:
+        result = await func(*args)
+    except Exception as exc:  # noqa: BLE001 - the whole point is to not die here
+        logger.exception("worker: job %s (%s) failed", job["id"], job["func"])
+        if job["attempt"] < _MAX_ATTEMPTS:
+            logger.info("worker: retrying job %s in %ds (attempt %d/%d)",
+                        job["id"], _RETRY_BACKOFF_SECONDS, job["attempt"], _MAX_ATTEMPTS)
+            await _finish(job["id"], "queued", str(exc),
+                          delay_seconds=_RETRY_BACKOFF_SECONDS)
+        else:
+            await _finish(job["id"], "error", str(exc))
+        return
+    await _finish(job["id"], "done")
+    logger.info("worker: job %s (%s) done: %s", job["id"], job["func"], result)
+
+
+async def requeue_stranded() -> int:
+    """Return jobs left `running` by a previous process to the queue.
+
+    A job is marked `running` before it executes and only moves off that state
+    when it finishes. So a row still sitting in `running` at startup means the
+    worker that owned it never got to write an outcome — it was killed. On a
+    server that is rare; on a laptop it is routine (force-quit, battery death,
+    an OS update reboot, sleep that the process doesn't survive).
+
+    Nothing else will ever pick those rows up: `_claim` only looks at `queued`.
+    Under ARQ this was handled for us — a job whose worker died lost its lock and
+    became visible again. The `jobs` table has no lease, so recovery has to be
+    explicit, and without it a force-quit mid-ingest strands the document at
+    "parsing" in the UI permanently.
+
+    Safe to be indiscriminate here because this runs at startup, before the loop
+    claims anything, and only one worker is expected: any `running` row at this
+    moment is definitionally abandoned. Attempts are not reset, so a job that
+    reliably kills the process still exhausts its retries rather than looping
+    forever.
+    """
+    async with acquire() as conn:
+        cursor = await conn.execute(
+            f"UPDATE jobs SET state = 'queued', updated_at = {NOW} WHERE state = 'running'")
+    n = cursor.rowcount
+    if n:
+        logger.warning("worker: requeued %d job(s) stranded by a previous run", n)
+    return n
+
+
+async def run_worker() -> None:
+    """Claim and run jobs until cancelled.
+
+    Assumes the database is already open. Opening and closing it belongs to
+    whoever owns the process (see ``_serve`` below) — if the loop did it, then
+    cancelling the loop would close a connection its caller might still be
+    using, which is exactly what the queue's own test harness does.
+    """
+    await requeue_stranded()
+    logger.info("worker: started, polling the jobs table")
+    while True:
+        job = await _claim()
+        if job is None:
+            await asyncio.sleep(_IDLE_SLEEP_SECONDS)
+            continue
+        await run_job(job)
+
+
+async def _serve() -> None:
+    """The worker process: open the database, run the loop, close it on the way out."""
+    from app.logging_setup import setup as setup_logging
+
+    setup_logging("worker")     # its own file: two processes sharing one interleave
+    await create_pool()
+    try:
+        await run_worker()
+    except asyncio.CancelledError:
+        logger.info("worker: stopping")
+    finally:
+        await close_pool()
 
 
 # ---------------------------------------------------------------------------
-# WorkerSettings — referenced by `arq app.worker.WorkerSettings`
-# ---------------------------------------------------------------------------
-
-class WorkerSettings:
-    functions = [ingest_document, generate_apkg, recalculate_projections,
-                 recalculate_clusters, finalize_project]
-    on_startup = startup
-    on_shutdown = shutdown
-    redis_settings = RedisSettings.from_dsn(settings.redis_public_url)
-    max_jobs = 10
-    job_timeout = 600  # 10 min max per job
-
-
-# ---------------------------------------------------------------------------
-# Manual test harness:  python -m app.worker [document_id]
+# Entry points:
 #
-# Runs ingest_document directly against the live DB + bucket — no Redis/ARQ
-# needed (ARQ would just call the same function). With no argument it picks the
-# most recently uploaded document. Prints the resulting status and a few chunks.
+#   python -m app.worker                  run the worker loop (this is the app)
+#   python -m app.worker ingest [doc_id]  run one ingest directly and dump the
+#                                         result — no queue involved. With no id
+#                                         it picks the most recently uploaded
+#                                         document.
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
 
-    async def _main() -> None:
+    async def _harness() -> None:
         await create_pool()
         try:
             async with acquire() as conn:
-                if len(sys.argv) > 1:
-                    doc_id = UUID(sys.argv[1])
+                if len(sys.argv) > 2:
+                    doc_id = UUID(sys.argv[2])
                 else:
                     doc_id = await conn.fetchval(
                         "SELECT id FROM documents ORDER BY created_at DESC LIMIT 1"
@@ -389,20 +562,22 @@ if __name__ == "__main__":
                         raise SystemExit("No documents in the DB — upload one first.")
                     print(f"Ingesting most recent document: {doc_id}")
 
-            result = await ingest_document({}, str(doc_id))
+            result = await ingest_document(str(doc_id))
             print("\nresult:", result)
 
             async with acquire() as conn:
-                status = await conn.fetchval("SELECT status FROM documents WHERE id = $1", doc_id)
+                status = await conn.fetchval("SELECT status FROM documents WHERE id = ?", doc_id)
                 rows = await conn.fetch(
                     """
-                    SELECT chunk_index, path, token_count_meta, LENGTH(content_full) AS full_len,
-                           LENGTH(content_sparse) AS sparse_len, (embedding IS NOT NULL) AS has_emb
-                    FROM (
-                        SELECT chunk_index, path, content_full, content_sparse, embedding,
-                               (metadata->>'token_count')::int AS token_count_meta
-                        FROM chunks WHERE document_id = $1 ORDER BY chunk_index
-                    ) s
+                    SELECT c.chunk_index, c.path,
+                           json_extract(c.metadata, '$.token_count') AS token_count_meta,
+                           LENGTH(c.content_full) AS full_len,
+                           LENGTH(c.content_sparse) AS sparse_len,
+                           (v.chunk_seq IS NOT NULL) AS has_emb
+                    FROM chunks c
+                    LEFT JOIN chunk_vectors v ON v.chunk_seq = c.seq
+                    WHERE c.document_id = ?
+                    ORDER BY c.chunk_index
                     """,
                     doc_id,
                 )
@@ -415,16 +590,16 @@ if __name__ == "__main__":
             # Step 7: run projections for this document's project and show coords.
             async with acquire() as conn:
                 project_id = await conn.fetchval(
-                    "SELECT project_id FROM documents WHERE id = $1", doc_id
+                    "SELECT project_id FROM documents WHERE id = ?", doc_id
                 )
-            proj_result = await recalculate_projections({}, str(project_id))
+            proj_result = await recalculate_projections(str(project_id))
             print("\nprojections:", proj_result)
             async with acquire() as conn:
                 sample = await conn.fetch(
                     """
                     SELECT umap_2d, umap_3d, pca_coords, tsne_coords
                     FROM chunks c JOIN documents d ON d.id = c.document_id
-                    WHERE d.project_id = $1 LIMIT 3
+                    WHERE d.project_id = ? LIMIT 3
                     """,
                     project_id,
                 )
@@ -433,14 +608,14 @@ if __name__ == "__main__":
                       f"pca={s['pca_coords']} tsne={s['tsne_coords']}")
 
             # Step 8: cluster the project and show the resulting nodes.
-            clu_result = await recalculate_clusters({}, str(project_id))
+            clu_result = await recalculate_clusters(str(project_id))
             print("\nclusters:", clu_result)
             async with acquire() as conn:
                 cl = await conn.fetch(
                     """
                     SELECT cl.label, cl.member_count, ch.path AS medoid_path
                     FROM clusters cl LEFT JOIN chunks ch ON ch.id = cl.medoid_chunk_id
-                    WHERE cl.project_id = $1 ORDER BY cl.member_count DESC
+                    WHERE cl.project_id = ? ORDER BY cl.member_count DESC
                     """,
                     project_id,
                 )
@@ -449,5 +624,12 @@ if __name__ == "__main__":
         finally:
             await close_pool()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    asyncio.run(_main())
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if len(sys.argv) > 1 and sys.argv[1] == "ingest":
+        asyncio.run(_harness())
+    else:
+        try:
+            asyncio.run(_serve())
+        except KeyboardInterrupt:
+            pass

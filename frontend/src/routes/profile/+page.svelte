@@ -1,6 +1,13 @@
 <script>
-  import { getSettings, updateSettings, setOpenRouterKey, clearOpenRouterKey } from "$lib/api/settings.js";
-  import { listProjects, deleteProject } from "$lib/api/projects.js";
+  import {
+    getSettings,
+    updateSettings,
+    setOpenRouterKey,
+    clearOpenRouterKey,
+    getProviders,
+    updateProvider,
+  } from "$lib/api/settings.js";
+  import { listProjects, deleteProject, exportProjectUrl } from "$lib/api/projects.js";
   import { session } from "$lib/stores/session.svelte.js";
   import { ACCENT_PRESETS, DEFAULT_ACCENT, applyAccent, setAccent } from "$lib/utils/theme.js";
   import Button from "$lib/components/ui/Button.svelte";
@@ -27,6 +34,24 @@
   /** @type {string|null} */
   let keyError = $state(null);
 
+  // Model providers — one endpoint/model/key_ref per role. Edited as a local copy
+  // so a half-typed base URL is never sent; each row saves on its own.
+  /** @type {import('$lib/api/settings.js').Provider[]} */
+  let providers = $state([]);
+  /** @type {string|null} */
+  let providerSaving = $state(null);
+  /** @type {string|null} */
+  let providerError = $state(null);
+  /** @type {string|null} */
+  let providerSavedFlash = $state(null);
+
+  /** @type {Record<string, string>} */
+  const ROLE_HELP = {
+    chat: "Writes the answers. The expensive one.",
+    planner: "Cheap classifier behind retrieval — many small calls.",
+    embed: "Vectors for retrieval. Changing the model needs a re-embed.",
+  };
+
   const accent = $derived(values.accent_color ?? DEFAULT_ACCENT);
 
   $effect(() => {
@@ -37,6 +62,7 @@
         values = { ...p.effective };
         keySet = p.openrouter_key_set;
         keyPreview = p.openrouter_key_preview;
+        providers = (await getProviders()).providers;
         // Sync the saved accent to localStorage + the document on load.
         setAccent(values.accent_color ?? DEFAULT_ACCENT);
       } catch (/** @type {any} */ err) {
@@ -46,6 +72,26 @@
       }
     })();
   });
+
+  /** Save one provider row. @param {import('$lib/api/settings.js').Provider} p */
+  async function saveProvider(p) {
+    providerSaving = p.role;
+    providerError = null;
+    try {
+      const res = await updateProvider(p.role, {
+        base_url: p.base_url.trim(),
+        model: p.model.trim(),
+        key_ref: p.key_ref.trim(),
+      });
+      providers = res.providers;
+      providerSavedFlash = p.role;
+      setTimeout(() => (providerSavedFlash = null), 1500);
+    } catch (/** @type {any} */ err) {
+      providerError = err?.message ?? "Failed to save provider";
+    } finally {
+      providerSaving = null;
+    }
+  }
 
   /** Live-preview an accent without persisting (commit happens on Save). @param {string} hex */
   function pickAccent(hex) {
@@ -204,6 +250,58 @@
           {#if keyError}<p class="mt-2 text-sm text-red-400">{keyError}</p>{/if}
         </section>
 
+        <!-- Model providers — any OpenAI-compatible endpoint, per role. -->
+        <section>
+          <h2 class="mb-1 text-base text-paper">Model providers</h2>
+          <p class="mb-3 text-sm text-paper/60">
+            Any OpenAI-compatible endpoint. For a local Ollama use
+            <code class="text-paper/80">http://localhost:11434/v1</code> and leave the key ref empty —
+            local models need no key, and cost shows as “no cost” instead of $0.00.
+          </p>
+
+          <div class="flex flex-col gap-4">
+            {#each providers as p (p.role)}
+              <div class="border border-paper/40 p-3">
+                <div class="mb-2 flex items-baseline justify-between">
+                  <span class="text-sm text-paper capitalize">{p.role}</span>
+                  <span class="text-xs text-paper/50">{ROLE_HELP[p.role] ?? ""}</span>
+                </div>
+                <div class="flex flex-col gap-2">
+                  <input
+                    bind:value={p.base_url}
+                    placeholder="https://openrouter.ai/api/v1"
+                    spellcheck="false"
+                    class="border border-paper bg-ink px-3 py-1.5 text-sm focus:outline-none"
+                  />
+                  <input
+                    bind:value={p.model}
+                    placeholder="model id"
+                    spellcheck="false"
+                    class="border border-paper bg-ink px-3 py-1.5 text-sm focus:outline-none"
+                  />
+                  <div class="flex items-center gap-2">
+                    <input
+                      bind:value={p.key_ref}
+                      placeholder="key ref (empty = no auth)"
+                      spellcheck="false"
+                      class="flex-1 border border-paper bg-ink px-3 py-1.5 text-sm focus:outline-none"
+                    />
+                    <Button onclick={() => saveProvider(p)} disabled={providerSaving === p.role}>
+                      {providerSaving === p.role ? "…" : providerSavedFlash === p.role ? "Saved" : "Save"}
+                    </Button>
+                  </div>
+                  {#if p.key_ref && !p.key_available}
+                    <p class="text-xs text-red-400">
+                      No key stored under “{p.key_ref}” — this role will fail until one is set.
+                    </p>
+                  {/if}
+                </div>
+              </div>
+            {/each}
+          </div>
+          {#if providerError}<p class="mt-2 text-sm text-red-400">{providerError}</p>{/if}
+        </section>
+
         <!-- Colour theme -->
         <section>
           <h2 class="mb-3 text-base text-paper">Colour theme</h2>
@@ -256,6 +354,13 @@
               {#each projects as p (p.id)}
                 <li class="flex items-center justify-between gap-3 px-3 py-2 text-sm">
                   <span class="min-w-0 flex-1 truncate" title={p.name}>{p.name}</span>
+                  <!-- A plain link, so the browser downloads it with the filename
+                       the server chose instead of buffering a blob in memory. -->
+                  <a
+                    href={exportProjectUrl(p.id)}
+                    class="shrink-0 text-paper/50 hover:text-accent"
+                    title="Download this project (sources + chats) as a zip"
+                  >Export</a>
                   <button
                     type="button"
                     class="shrink-0 text-paper/50 hover:text-red-400"

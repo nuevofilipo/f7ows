@@ -1,10 +1,11 @@
-"""Spawn & tear down the two backend processes (uvicorn web + arq worker).
+"""Spawn & tear down the two backend processes (uvicorn web + the worker).
 
-The driver speaks only HTTP to the web server; the worker drains the Redis queue
+The driver speaks only HTTP to the web server; the worker drains the `jobs` table
 in the background so the real ingest pipeline actually runs. Both inherit TRACE=1
 so the embedded tracer writes runs/.
 
-Assumes Postgres / Redis / the bucket are already reachable via backend/.env.
+Everything is local now — the database is a file, and there is no queue server —
+so this needs nothing running beforehand.
 """
 from __future__ import annotations
 
@@ -38,13 +39,13 @@ def _wait_healthy(timeout: float = 45.0) -> None:
 
 @contextmanager
 def managed_backend(*, quiet_worker: bool = False):
-    """Start uvicorn + arq, wait for /healthz, yield, then tear both down."""
+    """Start uvicorn + the worker, wait for /healthz, yield, then tear both down."""
     env = {**os.environ, "TRACE": "1"}
     web = _spawn([sys.executable, "-m", "uvicorn", "app.main:app",
                   "--host", HOST, "--port", str(PORT), "--log-level", "warning"], env)
     worker_out = subprocess.DEVNULL if quiet_worker else None
     worker = subprocess.Popen(
-        [sys.executable, "-m", "arq", "app.worker.WorkerSettings"],
+        [sys.executable, "-m", "app.worker"],
         cwd=str(BACKEND_DIR), env=env, stdout=worker_out, stderr=worker_out,
     )
     try:

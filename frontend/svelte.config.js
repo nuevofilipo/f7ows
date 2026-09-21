@@ -1,4 +1,4 @@
-import adapter from '@sveltejs/adapter-auto';
+import adapter from '@sveltejs/adapter-static';
 
 /** @type {import('@sveltejs/kit').Config} */
 const config = {
@@ -7,10 +7,19 @@ const config = {
 		runes: ({ filename }) => (filename.split(/[/\\]/).includes('node_modules') ? undefined : true)
 	},
 	kit: {
-		// adapter-auto only supports some environments, see https://svelte.dev/docs/kit/adapter-auto for a list.
-		// If your environment is not supported, or you settled on a specific environment, switch out the adapter.
-		// See https://svelte.dev/docs/kit/adapters for more information about adapters.
-		adapter: adapter()
+		// Desktop build: there is no Node server to deploy to, so the frontend is
+		// emitted as plain files that the Tauri shell serves from disk.
+		//
+		// Every route runs client-side already (`ssr = false` in +layout.js — auth
+		// is a cookie for a separate backend origin, which the SvelteKit server
+		// could never see), so nothing here is prerenderable and every URL has to
+		// resolve to the same shell. That is what `fallback` is.
+		//
+		// index.html, not the 200.html the docs prefer: their reason to avoid it is
+		// a collision with a prerendered homepage, and we prerender nothing. Tauri
+		// boots its webview at the directory root, so the entry point has to be
+		// index.html.
+		adapter: adapter({ fallback: 'index.html' })
 	}
 };
 

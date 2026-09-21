@@ -232,7 +232,9 @@
           <div class="absolute right-0 z-50 mt-2 w-56 border border-paper bg-ink p-3 text-sm">
             <p class="truncate text-paper/70">{session.user?.email}</p>
             <a href="/profile" class="mt-2 block w-full border border-paper px-3 py-1 text-center text-paper hover:bg-paper/10">Settings</a>
-            <button class="mt-2 w-full bg-accent px-3 py-1 text-paper hover:opacity-90" onclick={logout}>Log out</button>
+            {#if !session.singleUser}
+              <button class="mt-2 w-full bg-accent px-3 py-1 text-paper hover:opacity-90" onclick={logout}>Log out</button>
+            {/if}
           </div>
         {/if}
       </div>

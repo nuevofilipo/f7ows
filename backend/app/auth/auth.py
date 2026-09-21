@@ -12,16 +12,16 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timedelta, timezone
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import jwt
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
-from app import apikey
 from app.config import settings
 from app.db import acquire
+from app.local_user import ensure_local_user
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -29,13 +29,12 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 def _user_dict(row) -> dict:
     """Shape a users row into the internal current-user dict.
 
-    Never includes the password hash. The user's OpenRouter key is kept encrypted
-    under the underscore-prefixed ``_openrouter_key_enc`` (server-internal, stripped
-    before any response by :func:`public_user`); ``openrouter_key_set`` is the
-    non-secret boolean the frontend can show.
+    Never includes the password hash. The OpenRouter key is no longer part of the
+    user at all — it lives in the OS keychain (:mod:`app.keystore`), one key for
+    the one local user, so nothing here has to carry it around.
 
-    asyncpg returns jsonb as a JSON string (no codec registered), so parse the
-    settings blob back into a dict for callers (preferences resolution etc.).
+    SQLite has no JSON type — ``settings`` is TEXT holding a JSON object — so
+    parse the blob back into a dict for callers (preferences resolution etc.).
     """
     settings_value = row["settings"]
     if isinstance(settings_value, str):
@@ -43,14 +42,11 @@ def _user_dict(row) -> dict:
             settings_value = json.loads(settings_value)
         except (ValueError, TypeError):
             settings_value = {}
-    enc = row["openrouter_key"] if "openrouter_key" in row else None
     return {
         "id": row["id"],
         "email": row["email"],
         "settings": settings_value if isinstance(settings_value, dict) else {},
         "created_at": row["created_at"],
-        "_openrouter_key_enc": enc,
-        "openrouter_key_set": bool(enc),
     }
 
 
@@ -140,26 +136,40 @@ _UNAUTHORIZED = HTTPException(status.HTTP_401_UNAUTHORIZED, "Not authenticated")
 
 
 async def get_current_user(request: Request) -> dict:
+    """Resolve the request's user.
+
+    In single-user (desktop) mode a missing or unreadable cookie is not an error:
+    it resolves to the seeded local user. There is nobody else to be, and the
+    alternative — 401 until the frontend completes a login it has no credentials
+    for — would just be a lock on a door with one key taped to it.
+
+    That also makes auth independent of whether the cookie survives the trip.
+    The page and the API sit on different origins in the desktop shell (the shell
+    binds the backend to its own port), which is exactly the cross-site case
+    browsers keep tightening; the cookie is still issued and still honoured when
+    it arrives, but nothing depends on it arriving.
+    """
+    user_id = None
     token = request.cookies.get(settings.cookie_name)
-    if not token:
-        raise _UNAUTHORIZED
-    try:
-        user_id = decode_access_token(token)
-    except (jwt.InvalidTokenError, KeyError, ValueError):
-        raise _UNAUTHORIZED
+    if token:
+        try:
+            user_id = decode_access_token(token)
+        except (jwt.InvalidTokenError, KeyError, ValueError):
+            user_id = None
+
+    if user_id is None:
+        if not settings.single_user:
+            raise _UNAUTHORIZED
+        user_id = await ensure_local_user()
 
     async with acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, email, settings, openrouter_key, created_at FROM users WHERE id = $1",
+            "SELECT id, email, settings, created_at FROM users WHERE id = ?",
             user_id,
         )
     if row is None:
         raise _UNAUTHORIZED
-    user = _user_dict(row)
-    # Install this user's BYOK key for the whole request (and any task it spawns),
-    # so every model call uses their key; falls back to the global key if unset.
-    apikey.set_current_encrypted(user["_openrouter_key_enc"])
-    return user
+    return _user_dict(row)
 
 
 # OUTWARD POINTING ENDPOINTS STARTING FROM HERE:
@@ -174,11 +184,12 @@ async def register(request: Request, response: Response) -> dict:
         # ON CONFLICT lets us surface duplicate emails cleanly.
         row = await conn.fetchrow(
             """
-            INSERT INTO users (email, hashed_password)
-            VALUES ($1, $2)
+            INSERT INTO users (id, email, hashed_password)
+            VALUES (?, ?, ?)
             ON CONFLICT (email) DO NOTHING
-            RETURNING id, email, settings, openrouter_key, created_at
+            RETURNING id, email, settings, created_at
             """,
+            uuid4(),
             email,
             hash_password(password),
         )
@@ -194,8 +205,8 @@ async def login(request: Request, response: Response) -> dict:
     email, password = await _read_credentials(request, min_password=1)
     async with acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, email, hashed_password, settings, openrouter_key, created_at "
-            "FROM users WHERE email = $1",
+            "SELECT id, email, hashed_password, settings, created_at "
+            "FROM users WHERE email = ?",
             email,
         )
     # Run verify even when the user is missing (against a dummy hash) so the
@@ -215,5 +226,13 @@ async def logout(response: Response) -> None:
 
 
 @router.get("/me")
-async def me(current_user: dict = Depends(get_current_user)) -> dict:
-    return public_user(current_user)
+async def me(response: Response, current_user: dict = Depends(get_current_user)) -> dict:
+    """The current user — and, in single-user mode, the place the cookie gets
+    auto-issued. The frontend calls this once on boot, so the local user ends up
+    with a normal session cookie without ever seeing a login form, and the
+    /auth/login route stays untouched for when sync gives it a reason to exist."""
+    if settings.single_user:
+        _set_auth_cookie(response, create_access_token(current_user["id"]))
+    # The frontend needs to know which mode it is in — it hides "Log out" and the
+    # login form when there is only ever one user to be.
+    return {**public_user(current_user), "single_user": settings.single_user}

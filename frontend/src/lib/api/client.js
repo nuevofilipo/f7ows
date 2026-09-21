@@ -6,7 +6,7 @@
  * - JSON in, JSON out; throws {@link ApiError} (carrying status + detail) on any
  *   non-2xx so callers can branch on `err.status` (e.g. 401 -> log out).
  */
-import { API_BASE } from '$lib/config.js';
+import { apiBase } from '$lib/config.js';
 
 export class ApiError extends Error {
 	/** @param {number} status @param {string} detail */
@@ -37,7 +37,7 @@ export async function request(path, opts = {}) {
 		init.body = JSON.stringify(body);
 	}
 
-	const res = await fetch(`${API_BASE}${path}`, init);
+	const res = await fetch(`${apiBase()}${path}`, init);
 
 	if (res.status === 204) return null;
 

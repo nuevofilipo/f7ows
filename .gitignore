@@ -34,3 +34,11 @@ backend/alembic/
 # Transparent execution traces + testsuite PDF drop-folder
 backend/runs/
 backend/testsuite/pdfs_to_upload/*.pdf
+
+# F7ows desktop: local dev data (database, uploaded documents, traces, logs)
+backend/devdata/
+
+# PyInstaller output (packaging/f7ows-backend.spec). The spec and launcher are
+# tracked; everything they produce is not.
+backend/build/
+backend/dist/

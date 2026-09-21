@@ -1,0 +1,39 @@
+Running F7ows locally (dev — not packaged yet; that's phase 7)
+
+Three terminals.
+
+1) backend            from backend/
+     ./venv/Scripts/activate
+     uvicorn app.main:app --reload
+
+2) worker             from backend/  (same venv activated)
+     python -m app.worker
+
+3) frontend           from frontend/
+     npm run dev
+
+Then open http://localhost:5173
+
+No login screen: the backend seeds one local user and auto-issues the cookie.
+The OpenRouter key comes from the OS keychain, falling back to OPENROUTER_KEY in
+backend/.env for a source checkout.
+
+Where things live (dev run — all under backend/devdata/, gitignored):
+    database    devdata/data/db.sqlite3
+    documents   devdata/data/documents/
+    traces      devdata/cache/runs/
+    logs        devdata/logs/backend.log, worker.log
+
+    python -m app.paths          prints all of the above
+    GET /diagnostics/paths       the same, from inside the app
+    GET /diagnostics/logs/backend?lines=200
+    GET /diagnostics/runs
+
+The database starts empty — nothing carries over from the old Postgres one.
+
+Verification scripts (from backend/, venv active):
+    python scripts/check_sqlite_port.py    phase 1  (63 checks, ~3 min)
+    python scripts/check_job_queue.py      phase 2
+    python scripts/check_phase4.py         phase 4  (33 checks)
+    python scripts/check_phase5.py         phase 5  (48 checks)
+    python scripts/check_phase8.py         phase 8  (31 checks)
